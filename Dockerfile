@@ -1,9 +1,9 @@
-FROM node:24-alpine
+FROM python:3.13-slim
 WORKDIR /app
-COPY --chown=node:node package.json server.js ./
-COPY --chown=node:node public ./public
-RUN mkdir /app/data && chown node:node /app/data
-USER node
-ENV NODE_ENV=production
+RUN useradd --uid 1000 --create-home triage && mkdir /app/data && chown triage:triage /app/data
+COPY --chown=triage:triage server.py ./
+COPY --chown=triage:triage public ./public
+USER triage
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 EXPOSE 3000
-CMD ["node", "server.js"]
+CMD ["python", "server.py"]
