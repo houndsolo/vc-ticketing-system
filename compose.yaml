@@ -1,0 +1,12 @@
+services:
+  dark-triage:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      ACCESS_PASSWORD: ${ACCESS_PASSWORD:?Set ACCESS_PASSWORD in .env}
+    volumes:
+      - triage-data:/app/data
+volumes:
+  triage-data:
