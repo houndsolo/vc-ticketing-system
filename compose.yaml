@@ -5,7 +5,10 @@ services:
     ports:
       - "3000:3000"
     environment:
-      ACCESS_PASSWORD: ${ACCESS_PASSWORD:?Set ACCESS_PASSWORD in .env}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      # Only needed for the first start (empty database); ignored afterwards.
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      TRUST_PROXY: ${TRUST_PROXY:-}
     volumes:
       - triage-data:/app/data
 volumes:
