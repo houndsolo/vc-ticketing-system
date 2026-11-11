@@ -1,4 +1,4 @@
-"""dark_triage: dependency-free Python HTTP API and SQLite storage."""
+"""dark-triage: dependency-free Python HTTP API and SQLite storage."""
 
 from contextlib import closing
 import base64
@@ -602,14 +602,14 @@ def create_server(host="0.0.0.0", port=3000, data_dir="data", admin_username="ad
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     if os.environ.get("ACCESS_PASSWORD"):
-        logging.warning("ACCESS_PASSWORD is deprecated and ignored: dark_triage now uses user accounts. "
+        logging.warning("ACCESS_PASSWORD is deprecated and ignored: dark-triage now uses user accounts. "
                         "Remove it from your environment; see README.md for upgrade notes.")
     server = create_server(port=int(os.environ.get("PORT", "3000")), data_dir=os.environ.get("DATA_DIR", "data"),
                            admin_username=os.environ.get("ADMIN_USERNAME", "admin"),
                            admin_password=os.environ.get("ADMIN_PASSWORD", ""),
                            dev_mode=os.environ.get("DEV_MODE") == "1",
                            trust_proxy=os.environ.get("TRUST_PROXY") == "1")
-    print(f"dark_triage listening on port {server.server_port}", flush=True)
+    print(f"dark-triage listening on port {server.server_port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
