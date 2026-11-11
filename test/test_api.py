@@ -434,6 +434,34 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.call("/api/me", "PUT", {"color": "#000000"}, token)[0], 405)
         self.assertEqual(self.call("/api/me", "PATCH", {"color": "#000000"})[0], 401)
 
+    def test_change_own_display_name(self):
+        user, token = self.activate("sam", display_name="Sam")
+        ticket = self.call(method="POST", data=self.ticket(), token=token)[1]
+        self.call(f"/api/tickets/{ticket['id']}/comments", "POST", {"body": "Hello"}, token)
+        status, me, _ = self.call("/api/me", "PATCH", {"display_name": "  Samantha Carter  "}, token)
+        self.assertEqual(status, 200, me)
+        self.assertEqual(me["display_name"], "Samantha Carter")  # trimmed
+        self.assertEqual(me["custom_color"], None)  # untouched
+        # The new name shows everywhere the account appears.
+        detail = self.call(f"/api/tickets/{ticket['id']}", token=self.admin)[1]
+        self.assertEqual((detail["requester"], detail["comments"][0]["author"]), ("Samantha Carter", "Samantha Carter"))
+        self.assertIn("Samantha Carter", [p["display_name"] for p in self.call("/api/users/assignable", token=self.admin)[1]])
+        # Same rules as admin edits: 1-80 characters, not blank, a string.
+        for bad in ("", "   ", "x" * 81, None, 42, ["Sam"], True):
+            self.assertEqual(self.call("/api/me", "PATCH", {"display_name": bad}, token)[0], 400, bad)
+        self.assertEqual(self.call("/api/me", "PATCH", {"display_name": "y" * 80}, token)[0], 200)
+        # Name and color together; an invalid color rejects the whole change.
+        self.assertEqual(self.call("/api/me", "PATCH", {"display_name": "Sam C", "color": "nope"}, token)[0], 400)
+        self.assertEqual(self.call("/api/me", token=token)[1]["display_name"], "y" * 80)
+        both = self.call("/api/me", "PATCH", {"display_name": "Sam C", "color": "#123ABC"}, token)[1]
+        self.assertEqual((both["display_name"], both["color"]), ("Sam C", "#123abc"))
+        self.assertEqual(self.call("/api/me", "PATCH", {"role": "admin"}, token)[0], 400)  # nothing it may change
+        self.assertEqual(self.call("/api/me", token=token)[1]["role"], "user")
+        # Bots can rename themselves through their token, too.
+        bot = self.call("/api/users", "POST", {"username": "claude", "display_name": "Claude", "bot": True}, self.admin)[1]
+        bot_token = self.call(f"/api/users/{bot['id']}/tokens", "POST", {"name": "t"}, self.admin)[1]["token"]
+        self.assertEqual(self.call("/api/me", "PATCH", {"display_name": "Claude Code"}, bot_token)[1]["display_name"], "Claude Code")
+
     def test_color_permissions(self):
         sam_user, sam = self.activate("sam")
         alex_user, alex = self.activate("alex")

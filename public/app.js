@@ -53,14 +53,14 @@ async function api(path,options={}){
 const report=err=>{if(!(err instanceof AuthError))toast(err.message)};
 function applyMe(){
   const admin=me?.role==='admin';
-  $('#me-avatar').innerHTML=me?initials(me.display_name):'DT';
-  for(const el of [$('#me-avatar'),$('#side-color-dot')]){if(me?.color)el.dataset.color=me.color;else delete el.dataset.color}
-  $('#side-color').hidden=$('#side-tokens').hidden=!me;if(!me)$('#color-panel').hidden=true;else renderColorPanel();
+  // Every place that shows "me": sidebar profile, header avatar, Account page.
+  for(const el of [$('#me-avatar'),$('#header-avatar-circle'),$('#acct-avatar')]){el.innerHTML=me?initials(me.display_name):'DT';if(me?.color)el.dataset.color=me.color;else delete el.dataset.color}
   $('#me-name').textContent=me?me.display_name:'Not signed in';
   $('#me-role').textContent=me?`@${me.username} · ${admin?'Admin':'User'}`:'Sign in to continue';
-  $('#header-user').textContent=me?`◈ ${me.display_name}`:'◈ Private lab';
+  $('#header-user').hidden=!!me;$('#header-me').hidden=!me;$('#header-name').textContent=me?.display_name||'';
+  if(me)renderColorPickers();else toggleColorPanel(false);
   $$('.admin-only').forEach(el=>el.hidden=!admin);
-  if(!admin&&page==='users')showPage('tickets');
+  if((!admin&&page==='users')||(!me&&page==='account'))showPage('tickets');
 }
 function showLogin(){$$('dialog[open]').forEach(d=>d.close());if(!$('#login-dialog').open)$('#login-dialog').showModal();$('#login-username').focus()}
 function signedOut(){setToken('');me=null;tickets=[];users=[];assignable=[];assigneeFilter='';applyMe();render();showLogin()}
@@ -96,33 +96,39 @@ $('#password-form').onsubmit=async e=>{e.preventDefault();const button=e.submitt
   try{const forced=$('#password-dialog').dataset.forced;const data=await api('/me/password',{method:'POST',body:JSON.stringify({current_password:$('#current-password').value,new_password:$('#new-password').value})});
     me=data.user;applyMe();$('#password-dialog').close();toast('Password saved.');if(forced)await load()}
   catch(err){if(!(err instanceof AuthError))$('#password-error').textContent=err.message}finally{button.disabled=false}};
-$('#side-password').onclick=$('#header-password').onclick=()=>me&&showPassword(false);
 $('#side-logout').onclick=$('#lock').onclick=logout;
 
-// --- own avatar color (sidebar) --------------------------------------------------
-function renderColorPanel(){
-  $('#color-swatches').innerHTML=PALETTE.map(c=>`<button type="button" class="swatch${me?.custom_color===c?' selected':''}" data-color="${c}" data-swatch="${c}" aria-label="Use ${c}" aria-pressed="${me?.custom_color===c}" title="${c}"></button>`).join('');
-  $('#me-color').value=me?.color||PALETTE[0];$('#color-reset').disabled=!me?.custom_color;
-  $('#color-status').textContent=me?.custom_color?`Custom · ${me.custom_color}`:`Default · ${me?.color||''}`;
-  $$('[data-swatch]').forEach(b=>b.onclick=()=>saveMyColor(b.dataset.swatch));
+// --- own avatar color: header popover and Account page share .color-picker markup ---------
+function renderColorPickers(){
+  $$('.color-picker').forEach(root=>{
+    root.querySelector('.swatches').innerHTML=PALETTE.map(c=>`<button type="button" class="swatch${me?.custom_color===c?' selected':''}" data-color="${c}" data-swatch="${c}" aria-label="Use ${c}" aria-pressed="${me?.custom_color===c}" title="${c}"></button>`).join('');
+    root.querySelector('.color-input').value=me?.color||PALETTE[0];root.querySelector('.color-reset').disabled=!me?.custom_color;
+  });
+  $$('.color-status').forEach(el=>el.textContent=me?.custom_color?`Custom · ${me.custom_color}`:`Default · ${me?.color||''}`);
 }
-async function saveMyColor(color){
-  try{me=await api('/me',{method:'PATCH',body:JSON.stringify({color})});applyMe();toast(color?'Color saved.':'Back to your default color.');await load();if(page==='users')await loadUsers()}
-  catch(err){report(err);applyMe()}
+async function saveMe(changes,message){
+  me=await api('/me',{method:'PATCH',body:JSON.stringify(changes)});applyMe();if(page==='account')renderAccount(false);toast(message);
+  // Names and colors appear on tickets, so refresh them.
+  await load();if(page==='users')await loadUsers();
 }
-function toggleColorPanel(open){const panel=$('#color-panel');panel.hidden=!open;$('#side-color').setAttribute('aria-expanded',String(open));if(open){renderColorPanel();$('#color-swatches .swatch')?.focus()}}
-$('#side-color').onclick=()=>toggleColorPanel($('#color-panel').hidden);
+const saveMyColor=color=>saveMe({color},color?'Color saved.':'Back to your default color.').catch(err=>{report(err);applyMe()});
+const previewColor=c=>[$('#me-avatar'),$('#header-avatar-circle'),$('#acct-avatar')].forEach(el=>el.dataset.color=c);
+$$('.color-picker').forEach(root=>{
+  root.addEventListener('click',e=>{const b=e.target.closest('[data-swatch]');if(b)saveMyColor(b.dataset.swatch)});
+  const input=root.querySelector('.color-input');input.oninput=()=>previewColor(input.value);input.onchange=()=>saveMyColor(input.value);
+  root.querySelector('.color-reset').onclick=()=>saveMyColor(null);
+});
+function toggleColorPanel(open){const panel=$('#color-panel');panel.hidden=!open;$('#header-avatar').setAttribute('aria-expanded',String(open));if(open){renderColorPickers();panel.querySelector('.swatch')?.focus()}}
+$('#header-avatar').onclick=()=>toggleColorPanel($('#color-panel').hidden);
 // Close the popover on Escape or a click elsewhere.
-document.addEventListener('click',e=>{if(!$('#color-panel').hidden&&!e.target.closest('#color-panel,#side-color'))toggleColorPanel(false)});
-document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#color-panel').hidden&&!$$('dialog[open]').length){toggleColorPanel(false);$('#side-color').focus()}});
-$('#me-color').oninput=e=>$('#me-avatar').dataset.color=$('#side-color-dot').dataset.color=e.target.value;
-$('#me-color').onchange=e=>saveMyColor(e.target.value);
-$('#color-reset').onclick=()=>saveMyColor(null);
+document.addEventListener('click',e=>{if(!$('#color-panel').hidden&&!e.target.closest('#color-panel,#header-avatar'))toggleColorPanel(false)});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#color-panel').hidden&&!$$('dialog[open]').length){toggleColorPanel(false);$('#header-avatar').focus()}});
 
 // --- tickets -----------------------------------------------------------------
 async function load(){try{[tickets,assignable]=await Promise.all([api('/tickets'),api('/users/assignable')]);renderAssigneeFilter();render();openLinked()}catch(err){report(err)}}
 // Deep links such as /#DT-007 (printed by tools/dt.py) open that ticket once.
-function openLinked(){const m=/^#(?:DT-)?0*(\d{1,18})$/i.exec(location.hash);if(!m)return;history.replaceState(null,'',location.pathname+location.search);openTicket(m[1])}
+function openLinked(){if(location.hash==='#account'){if(page!=='account')showPage('account');return}
+  const m=/^#(?:DT-)?0*(\d{1,18})$/i.exec(location.hash);if(!m)return;history.replaceState(null,'',location.pathname+location.search);openTicket(m[1])}
 window.addEventListener('hashchange',()=>{if(me&&!me.must_change)openLinked()});
 function render(){const active=tickets.filter(t=>t.status!=='Resolved');$('#stat-active').textContent=active.length;$('#stat-progress').textContent=tickets.filter(t=>t.status==='In progress').length;$('#stat-critical').textContent=active.filter(t=>['Critical','High'].includes(t.priority)).length;$('#stat-resolved').textContent=tickets.filter(t=>t.status==='Resolved').length;$('#nav-count').textContent=active.length;
 const q=$('#search').value.toLowerCase(),p=$('#priority-filter').value;
@@ -147,13 +153,40 @@ function assignToMe(){if(!current||!me)return;const sel=$('#edit-assignee');if(!
 
 // --- users (admins only) -------------------------------------------------------
 function showPage(name){
-  page=name==='users'&&me?.role==='admin'?'users':'tickets';
-  $('#tickets-page').hidden=page!=='tickets';$('#users-page').hidden=page!=='users';
-  $('#nav-users').classList.toggle('active',page==='users');
-  if(page==='users'){$$('[data-view]').forEach(b=>b.classList.remove('active'));$('#crumb').textContent='Users';loadUsers()}
+  page=name==='users'&&me?.role==='admin'?'users':name==='account'&&me?'account':'tickets';
+  $('#tickets-page').hidden=page!=='tickets';$('#users-page').hidden=page!=='users';$('#account-page').hidden=page!=='account';
+  $('#nav-users').classList.toggle('active',page==='users');$('#nav-account').classList.toggle('active',page==='account');
+  // The Account page has a URL (#account); leaving it clears the hash.
+  const hash=page==='account'?'#account':'';if(location.hash!==hash&&(hash||location.hash==='#account'))history.replaceState(null,'',location.pathname+location.search+hash);
+  if(page!=='tickets')$$('[data-view]').forEach(b=>b.classList.remove('active'));
+  if(page!=='account')accountTokens.hideReveal();
+  if(page==='users'){$('#crumb').textContent='Users';loadUsers()}
+  else if(page==='account'){$('#crumb').textContent='Account';renderAccount(true)}
   else{$$('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===view));render()}
 }
 $('#nav-users').onclick=()=>showPage('users');
+$('#nav-account').onclick=$('#side-profile').onclick=$('#header-account').onclick=()=>{toggleColorPanel(false);showPage('account')};
+$('#acct-users-link').onclick=()=>showPage('users');
+
+// --- Account page ----------------------------------------------------------------------------
+function renderAccount(fresh){
+  if(!me)return;
+  $('#acct-display').textContent=me.display_name;$('#acct-handle').textContent=`@${me.username}`;
+  $('#acct-username').textContent=me.username;$('#acct-role').textContent=me.role==='admin'?'Admin · tickets and user management':'User · tickets';
+  renderColorPickers();
+  if(fresh){$('#acct-name').value=me.display_name;$('#profile-error').textContent='';$('#acct-password-form').reset();$('#acct-password-error').textContent='';$('#acct-password-username').value=me.username;accountTokens.open('/me/tokens')}
+}
+$('#profile-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;const name=$('#acct-name').value.trim();$('#profile-error').textContent='';
+  if(!name)return $('#profile-error').textContent='Enter a display name (up to 80 characters).';
+  if(name===me.display_name)return toast('That’s already your name.');
+  button.disabled=true;try{await saveMe({display_name:name},'Display name saved.');$('#acct-name').value=me.display_name}
+  catch(err){if(!(err instanceof AuthError))$('#profile-error').textContent=err.message}finally{button.disabled=false}};
+$('#acct-password-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;
+  if($('#acct-new').value!==$('#acct-confirm').value){$('#acct-password-error').textContent='The new passwords don’t match.';return}
+  button.disabled=true;$('#acct-password-error').textContent='';
+  try{const data=await api('/me/password',{method:'POST',body:JSON.stringify({current_password:$('#acct-current').value,new_password:$('#acct-new').value})});
+    me=data.user;applyMe();$('#acct-password-form').reset();toast('Password saved. Your other devices were signed out.')}
+  catch(err){if(!(err instanceof AuthError))$('#acct-password-error').textContent=err.message}finally{button.disabled=false}};
 async function loadUsers(){try{users=await api('/users');renderUsers()}catch(err){report(err)}}
 function renderUsers(){
   $('#user-count').textContent=users.length;
@@ -176,33 +209,37 @@ $('#bot-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;bu
   try{const data=Object.fromEntries(new FormData(e.target));const u=await api('/users',{method:'POST',body:JSON.stringify({...data,bot:true})});$('#bot-dialog').close();toast(`Bot @${u.username} created. Give it an API token.`);await loadUsers();openTokens(`/users/${u.id}/tokens`,u)}
   catch(err){if(!(err instanceof AuthError))$('#bot-error').textContent=err.message}finally{button.disabled=false}};
 
-// --- API tokens (own, or any account's for admins) ------------------------------------
-let tokenScope=null;
-async function openTokens(path,owner){
-  tokenScope={path,owner};const mine=owner.id===me?.id;
+// --- API tokens: one manager per set of elements (#<p>-list, -reveal, -value, -copy, -form, -name, -error) ---
+function tokenManager(p){
+  const el=s=>$(`#${p}-${s}`),ui={path:null};
+  ui.open=async path=>{ui.path=path;el('form').reset();el('error').textContent='';ui.hideReveal();el('list').innerHTML='<p class="muted">Loading…</p>';await ui.load()};
+  ui.hideReveal=()=>{el('value').value='';el('reveal').hidden=true};
+  ui.load=async()=>{
+    try{const list=await api(ui.path);
+      el('list').innerHTML=list.length?`<table class="token-table"><thead><tr><th>Name</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody>${list.map(t=>`<tr><td>${esc(t.name)}</td><td class="muted">${esc(when(t.created))}</td><td class="muted">${esc(when(t.last_used))}</td><td><button class="secondary small danger" data-revoke="${t.id}">Revoke</button></td></tr>`).join('')}</tbody></table>`:'<p class="muted">No active tokens.</p>';
+      el('list').querySelectorAll('[data-revoke]').forEach(b=>b.onclick=async()=>{const t=list.find(x=>x.id===+b.dataset.revoke);if(!confirm(`Revoke “${t.name}”? Anything using it stops working immediately.`))return;
+        try{await api(`${ui.path}/${t.id}`,{method:'DELETE'});toast(`Token “${t.name}” revoked.`);await ui.load()}catch(err){report(err)}});
+    }catch(err){el('list').innerHTML='';report(err)}
+  };
+  el('form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;button.disabled=true;el('error').textContent='';
+    try{const t=await api(ui.path,{method:'POST',body:JSON.stringify({name:el('name').value})});
+      el('value').value=t.token;el('reveal').hidden=false;el('form').reset();el('value').select();await ui.load()}
+    catch(err){if(!(err instanceof AuthError))el('error').textContent=err.message}finally{button.disabled=false}};
+  el('copy').onclick=async()=>{const input=el('value');
+    // navigator.clipboard needs HTTPS or localhost; fall back to the selection for plain-HTTP LAN use.
+    try{await navigator.clipboard.writeText(input.value);toast('Token copied.')}catch{input.select();toast(document.execCommand('copy')?'Token copied.':'Press Ctrl+C to copy the selected token.')}};
+  return ui;
+}
+const dialogTokens=tokenManager('token'),accountTokens=tokenManager('acct-token');
+// Admins: any account's tokens, from the Users page.
+function openTokens(path,owner){
+  const mine=owner.id===me?.id;
   $('#tokens-eyebrow').textContent=mine?'YOUR ACCOUNT · API TOKENS':`ADMIN · @${owner.username}`;
   $('#tokens-title').innerHTML=(mine?'Your API tokens':`Tokens for ${esc(owner.display_name)}`)+'<span class="green">.</span>';
-  $('#token-form').reset();$('#token-error').textContent='';$('#token-reveal').hidden=true;$('#token-value').value='';
-  $('#token-list').innerHTML='<p class="muted">Loading…</p>';
   if(!$('#tokens-dialog').open)$('#tokens-dialog').showModal();$('#token-name').focus();
-  await loadTokens();
+  return dialogTokens.open(path);
 }
-async function loadTokens(){
-  try{const list=await api(tokenScope.path);
-    $('#token-list').innerHTML=list.length?`<table class="token-table"><thead><tr><th>Name</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody>${list.map(t=>`<tr><td>${esc(t.name)}</td><td class="muted">${esc(when(t.created))}</td><td class="muted">${esc(when(t.last_used))}</td><td><button class="secondary small danger" data-revoke="${t.id}">Revoke</button></td></tr>`).join('')}</tbody></table>`:'<p class="muted">No active tokens.</p>';
-    $$('[data-revoke]').forEach(b=>b.onclick=async()=>{const t=list.find(x=>x.id===+b.dataset.revoke);if(!confirm(`Revoke “${t.name}”? Anything using it stops working immediately.`))return;
-      try{await api(`${tokenScope.path}/${t.id}`,{method:'DELETE'});toast(`Token “${t.name}” revoked.`);await loadTokens()}catch(err){report(err)}});
-  }catch(err){$('#token-list').innerHTML='';report(err)}
-}
-$('#token-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;button.disabled=true;$('#token-error').textContent='';
-  try{const t=await api(tokenScope.path,{method:'POST',body:JSON.stringify({name:$('#token-name').value})});
-    $('#token-value').value=t.token;$('#token-reveal').hidden=false;$('#token-form').reset();$('#token-value').select();await loadTokens()}
-  catch(err){if(!(err instanceof AuthError))$('#token-error').textContent=err.message}finally{button.disabled=false}};
-$('#token-copy').onclick=async()=>{const input=$('#token-value');
-  // navigator.clipboard needs HTTPS or localhost; fall back to the selection for plain-HTTP LAN use.
-  try{await navigator.clipboard.writeText(input.value);toast('Token copied.')}catch{input.select();toast(document.execCommand('copy')?'Token copied.':'Press Ctrl+C to copy the selected token.')}};
-$('#tokens-dialog').addEventListener('close',()=>{$('#token-value').value='';$('#token-reveal').hidden=true});
-$('#side-tokens').onclick=()=>me&&openTokens('/me/tokens',me);
+$('#tokens-dialog').addEventListener('close',()=>dialogTokens.hideReveal());
 
 function newUser(){$('#user-form').reset();$('#user-error').textContent='';$('#user-dialog').showModal();$('#user-username').focus()}
 $('#new-user').onclick=newUser;

@@ -38,18 +38,18 @@ Everyone signs in with their own username and password. There is no self sign-up
 - **Reset password** (admin) sets a new temporary password, signs the user out everywhere, and forces another change at next sign-in.
 - **Disable** (admin) blocks sign-in and revokes all of that account's sessions immediately. **Enable** lets them sign in again. Admins can't disable their own account.
 - There must always be at least one active admin. The server refuses to demote or disable the last one.
-- **Change password** (everyone): in the sidebar, or the ✎ button in the header. It requires the current password and signs out your other devices.
+- **Account page** (everyone): open it with **Account** in the sidebar, your name in the top-right corner, or your profile at the bottom of the sidebar (URL `/#account`). Its **Profile** section changes your display name (1–80 characters, the same rule admins use) and avatar color, and shows your username and role. **Password** changes your password: it requires the current one and signs out your other devices. **API tokens** creates and revokes your own tokens. A temporary password is still changed on the forced screen at first sign-in.
 - Tickets and comments record the author's account. Names are shown from the account's current display name, so they can't be spoofed. Tickets and comments from the shared-password version keep the name that was typed in.
 
 Passwords are hashed with scrypt (random salt per password) and must be 8–256 characters. Sign-in returns a random session token. The browser keeps it in local storage and sends it as `Authorization: Bearer <token>`. The server stores only a SHA-256 hash of the token. Sessions slide: each one lasts 14 days after its last use. **Log out** ends the current session. After 5 failed sign-ins for one username, or 20 from one IP address within 15 minutes, further attempts are delayed with exponential backoff (up to 15 minutes). The counters are in memory and reset on restart.
 
 ## Avatar colors
 
-Every person's avatar circle has its own color: in list rows, kanban cards, the ticket view (requester, assignee, updates and activity lines), the sidebar profile and the Users page.
+Every person's avatar circle has its own color: in list rows, kanban cards, the ticket view (requester, assignee, updates and activity lines), the header and sidebar profile, the Account page and the Users page.
 
 - **Default:** with no color chosen, the server picks one from a fixed palette of ten colors that read well on the dark theme (hot pink, cyan, violet, mint, gold, rose, light pink, blue, orange and lime). The pick is a hash of the username, so it is stable across restarts and devices. Tickets and comments from the shared-password version use the hash of their stored name.
 - **Readable initials:** the circle is filled with the color, and the initials are dark or white, whichever contrasts more (WCAG luminance). Custom dark colors stay readable.
-- **Your own color** (everyone): click **Color** under your name in the sidebar. Pick a palette swatch, or **Custom** for any color from the native picker. It saves immediately. **Use default** goes back to the hashed color.
+- **Your own color** (everyone): click your avatar in the top-right corner, or use the color picker on the **Account** page. Pick a palette swatch, or **Custom** for any color from the native picker. It saves immediately. **Use default** goes back to the hashed color.
 - **Anyone's color** (admin): on the **Users** page, click a person's color circle to pick a new one. **Reset** returns it to the default.
 - Colors are stored as `#rrggbb` in the nullable `users.color` column. `NULL` means the default.
 
@@ -64,7 +64,7 @@ AI agents and scripts file and update tickets through the API, as **bot accounts
 
 ### Create a bot and a token in the web app
 
-Users page (admin): **New bot** takes a username and a display name, then opens the bot's **API tokens** dialog. Name the token after where it will live (e.g. `a0-nix claude-code`), click **Create token** and **Copy** it. It won't be shown again. The same dialog lists each token's name, creation time and last use, and has a **Revoke** button per token. Everyone can manage their own tokens via **API tokens** in the sidebar profile area.
+Users page (admin): **New bot** takes a username and a display name, then opens the bot's **API tokens** dialog. Name the token after where it will live (e.g. `a0-nix claude-code`), click **Create token** and **Copy** it. It won't be shown again. The same dialog lists each token's name, creation time and last use, and has a **Revoke** button per token. Everyone manages their own tokens on the **Account** page.
 
 ### Or with the admin CLI on the server host
 
@@ -135,7 +135,7 @@ Requests without an `Origin` header (CLI tools) are fine. Requests whose `Origin
 | Variable | Default | Purpose |
 |---|---|---|
 | `ADMIN_USERNAME` | `admin` | Username of the admin account created on first start. |
-| `ADMIN_PASSWORD` | — | Password of that account. **Required on first start** (empty database) unless `DEV_MODE=1`. Ignored once any account exists. To change it later, use **Change password** in the app. |
+| `ADMIN_PASSWORD` | — | Password of that account. **Required on first start** (empty database) unless `DEV_MODE=1`. Ignored once any account exists. To change it later, use the **Account** page in the app. |
 | `DEV_MODE` | unset | `1` relaxes the `ADMIN_PASSWORD` requirement for local development: a random admin password is generated and printed to the log. Never use it in production. |
 | `TRUST_PROXY` | unset | `1` takes the client IP for login throttling from the last `X-Forwarded-For` entry. Set it only behind your own reverse proxy. |
 | `PORT` | `3000` | Listening port. |
@@ -170,7 +170,7 @@ API changes: the `requester` field on `POST /api/tickets` and the `author` field
 | `POST /api/logout` | signed in | Revokes the current token |
 | `GET /api/me` | signed in | Current user (`must_change` is true while on a temporary password) |
 | `GET/POST /api/me/tokens` `{name}`, `DELETE /api/me/tokens/:tid` | signed in (session, not a token) | Your API tokens. POST → 201 `{id,name,created,last_used,token}`: the only time `token` is returned. 409 for a duplicate active name |
-| `PATCH /api/me` `{color}` | signed in | Set your avatar color: `"#rrggbb"`, or `null` for the default. 400 for anything else → updated user |
+| `PATCH /api/me` `{display_name?,color?}` | signed in | Change your display name (1–80 characters, trimmed) and/or avatar color (`"#rrggbb"`, or `null` for the default). Send at least one; an invalid value gets a 400 and nothing is changed. → updated user |
 | `POST /api/me/password` `{current_password,new_password}` | signed in | Clears `must_change`, signs out other sessions |
 | `GET /api/tickets?assignee=<id>\|me\|none` | signed in | All tickets, newest activity first; `assignee` is an optional filter (400 if it's anything else) |
 | `POST /api/tickets` `{title,description,service,priority,type,assignee_id?}` | signed in | → 201 ticket. You are the requester. `assignee_id` is a user id or `null` |
@@ -225,4 +225,4 @@ SQLite uses WAL mode and parameterized queries. Back up the entire data director
 python3 -m unittest discover -s test -v
 ```
 
-The integration tests start the real server. They cover admin bootstrap, login and logout, wrong passwords and throttling, forced password change for temporary passwords, admin create, reset, role change, disable and enable, non-admins being refused user management, last-admin protection, session revocation, shared ticket rights (status, priority, comments), assignment (on create, reassign, unassign, the `me`/`none`/id filters, disabled and nonexistent assignees, the assignable-user list vs. admin-only `/api/users`, activity lines), validation, cross-origin rejection, persistence across restarts, avatar colors (deterministic valid defaults, set and reset your own, strict validation, admin-only changes to others, colors in tickets, comments, activity lines and the assignable list), bots and API tokens (token auth on every endpoint, revocation, `last_used`, bot password login refused like an unknown user, disabled bots' tokens rejected, non-admins can't manage other accounts' tokens, `/api/me/tokens`, tokens can't mint tokens, cross-origin check with tokens), the admin CLI (run as a subprocess against the live test database), the `dt` client end to end (`whoami`, `new`, `list`, `show`, `comment`, `update`, error exit codes), and migration of an old-schema database and of an accounts database without `users.color`. Browser visual QA and Docker execution are not included.
+The integration tests start the real server. They cover admin bootstrap, login and logout, wrong passwords and throttling, forced password change for temporary passwords, admin create, reset, role change, disable and enable, non-admins being refused user management, last-admin protection, session revocation, shared ticket rights (status, priority, comments), assignment (on create, reassign, unassign, the `me`/`none`/id filters, disabled and nonexistent assignees, the assignable-user list vs. admin-only `/api/users`, activity lines), validation, cross-origin rejection, persistence across restarts, display-name changes via `PATCH /api/me` (valid, invalid, shown on tickets and comments), avatar colors (deterministic valid defaults, set and reset your own, strict validation, admin-only changes to others, colors in tickets, comments, activity lines and the assignable list), bots and API tokens (token auth on every endpoint, revocation, `last_used`, bot password login refused like an unknown user, disabled bots' tokens rejected, non-admins can't manage other accounts' tokens, `/api/me/tokens`, tokens can't mint tokens, cross-origin check with tokens), the admin CLI (run as a subprocess against the live test database), the `dt` client end to end (`whoami`, `new`, `list`, `show`, `comment`, `update`, error exit codes), and migration of an old-schema database and of an accounts database without `users.color`. Browser visual QA and Docker execution are not included.

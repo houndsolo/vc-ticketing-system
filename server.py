@@ -506,11 +506,16 @@ class Handler(BaseHTTPRequestHandler):
         return 200, {"user": public_user(db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone())}
 
     def update_me(self, db, user):
-        """Self-service profile changes. Only the avatar color for now."""
+        """Self-service profile changes: display name and avatar color."""
         x = self.body()
-        if "color" not in x:
-            raise RequestError(400, "Nothing to update: send color.")
-        db.execute("UPDATE users SET color=?,updated=? WHERE id=?", (parse_color(x["color"]), now(), user["id"]))
+        if not any(k in x for k in ("display_name", "color")):
+            raise RequestError(400, "Nothing to update: send display_name and/or color.")
+        display_name = x.get("display_name", user["display_name"])
+        if not valid(display_name, 80):  # the same rule as account creation and admin edits
+            raise RequestError(400, "Enter a display name (up to 80 characters).")
+        color = parse_color(x["color"]) if "color" in x else user["color"]
+        db.execute("UPDATE users SET display_name=?,color=?,updated=? WHERE id=?",
+                   (display_name.strip(), color, now(), user["id"]))
         return 200, public_user(db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone())
 
     # --- user management (admins only) ------------------------------------
