@@ -126,3 +126,7 @@ button.profile:hover #me-name{color:var(--accent-2)}
 @media(max-height:960px){.sidebar-bottom>p{display:none}.sidebar-bottom .signal{margin-bottom:16px}.workspace{margin:26px 0}}
 .token-reveal>label{display:block;color:var(--muted);font-size:14px;margin:12px 0 10px}
 .account-card .color-picker{max-width:260px}
+
+/* Ticket view: wide enough for long descriptions and logs */
+#detail-dialog{width:min(1040px,94vw)}
+#detail-dialog .description,#detail-dialog .comment p{overflow-wrap:anywhere}
