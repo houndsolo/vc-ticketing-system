@@ -301,6 +301,95 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.call("/", "HEAD")[1], b"")
         self.assertEqual(self.call("/", "POST", {})[0], 405)
 
+    # --- assignment ------------------------------------------------------------
+
+    def test_assign_on_create_reassign_and_unassign(self):
+        sam_user, sam = self.activate("sam", display_name="Sam Carter")
+        alex_user, alex = self.activate("alex", display_name="Alex Doe")
+        status, ticket, _ = self.call(method="POST", data={**self.ticket(), "assignee_id": alex_user["id"]}, token=sam)
+        self.assertEqual(status, 201, ticket)
+        self.assertEqual(ticket["assignee"], {"id": alex_user["id"], "username": "alex", "display_name": "Alex Doe", "disabled": False})
+        unassigned = self.call(method="POST", data=self.ticket(), token=sam)[1]
+        self.assertIsNone(unassigned["assignee"])
+        self.assertIsNone(self.call(method="POST", data={**self.ticket(), "assignee_id": None}, token=sam)[1]["assignee"])
+        path = f"/api/tickets/{ticket['id']}"
+        # A non-admin reassigns; status and priority are untouched by a partial PATCH.
+        status, changed, _ = self.call(path, "PATCH", {"assignee_id": sam_user["id"]}, alex)
+        self.assertEqual(status, 200, changed)
+        self.assertEqual(changed["assignee"]["username"], "sam")
+        self.assertEqual((changed["status"], changed["priority"]), ("Open", "High"))
+        # Re-sending the same assignee records nothing new.
+        self.assertEqual(self.call(path, "PATCH", {"assignee_id": sam_user["id"], "status": "In progress"}, sam)[0], 200)
+        status, changed, _ = self.call(path, "PATCH", {"assignee_id": None}, sam)
+        self.assertEqual(status, 200)
+        self.assertIsNone(changed["assignee"])
+        self.assertEqual(changed["status"], "In progress")
+        # The old full PATCH shape still works and leaves the assignee alone.
+        self.call(path, "PATCH", {"assignee_id": alex_user["id"]}, self.admin)
+        self.assertEqual(self.call(path, "PATCH", {"status": "Waiting", "priority": "Low"}, sam)[1]["assignee"]["id"], alex_user["id"])
+        activity = [(c["kind"], c["author"], c["body"]) for c in self.call(path, token=sam)[1]["comments"]]
+        self.assertEqual(activity, [("system", "Sam Carter", "assigned this to Alex Doe"),
+                                    ("system", "Alex Doe", "assigned this to Sam Carter"),
+                                    ("system", "Sam Carter", "unassigned Sam Carter"),
+                                    ("system", "admin", "assigned this to Alex Doe")])
+        # Posted updates are kind "comment"; system lines can't be forged through the comments API.
+        self.call(path + "/comments", "POST", {"body": "On it", "kind": "system"}, alex)
+        self.assertEqual(self.call(path, token=sam)[1]["comments"][-1]["kind"], "comment")
+        for bad in ({}, {"assignee_id": "2"}, {"assignee_id": True}, {"assignee_id": 1.5}, {"status": "Nope"}):
+            self.assertEqual(self.call(path, "PATCH", bad, sam)[0], 400, bad)
+
+    def test_assignee_filter(self):
+        sam_user, sam = self.activate("sam")
+        alex_user, _ = self.activate("alex")
+        mine = self.call(method="POST", data={**self.ticket(), "assignee_id": sam_user["id"]}, token=sam)[1]
+        theirs = self.call(method="POST", data={**self.ticket("Request"), "assignee_id": alex_user["id"]}, token=sam)[1]
+        nobody = self.call(method="POST", data=self.ticket("Change"), token=sam)[1]
+        ids = lambda query, token=sam: [t["id"] for t in self.call("/api/tickets" + query, token=token)[1]]
+        self.assertEqual(ids("?assignee=me"), [mine["id"]])
+        self.assertEqual(ids("?assignee=me", self.admin), [])
+        self.assertEqual(ids("?assignee=none"), [nobody["id"]])
+        self.assertEqual(ids(f"?assignee={alex_user['id']}"), [theirs["id"]])
+        self.assertEqual(ids("?assignee=9999"), [])
+        self.assertEqual(sorted(ids("")), sorted([mine["id"], theirs["id"], nobody["id"]]))
+        self.assertEqual(self.call("/api/tickets?assignee=bob", token=sam)[0], 400)
+
+    def test_disabled_and_nonexistent_assignees(self):
+        sam_user, sam = self.activate("sam", display_name="Sam Carter")
+        alex_user, alex = self.activate("alex", display_name="Alex Doe")
+        self.assertEqual(self.call(method="POST", data={**self.ticket(), "assignee_id": 9999}, token=sam)[0], 400)
+        ticket = self.call(method="POST", data={**self.ticket(), "assignee_id": alex_user["id"]}, token=sam)[1]
+        path = f"/api/tickets/{ticket['id']}"
+        self.assertEqual(self.call(path, "PATCH", {"assignee_id": 9999}, sam)[0], 400)
+        self.call(f"/api/users/{alex_user['id']}", "PATCH", {"disabled": True}, self.admin)
+        # The existing assignment is kept and shown as disabled.
+        kept = self.call(path, token=sam)[1]["assignee"]
+        self.assertEqual((kept["id"], kept["disabled"]), (alex_user["id"], True))
+        self.assertTrue(self.call("/api/tickets?assignee=" + str(alex_user["id"]), token=sam)[1][0]["assignee"]["disabled"])
+        # Saving the ticket with its current (disabled) assignee is fine...
+        self.assertEqual(self.call(path, "PATCH", {"assignee_id": alex_user["id"], "status": "Waiting"}, sam)[0], 200)
+        # ...but a disabled account can't be newly assigned.
+        other = self.call(method="POST", data=self.ticket(), token=sam)[1]
+        self.assertEqual(self.call(f"/api/tickets/{other['id']}", "PATCH", {"assignee_id": alex_user["id"]}, sam)[0], 400)
+        self.assertEqual(self.call(method="POST", data={**self.ticket(), "assignee_id": alex_user["id"]}, token=sam)[0], 400)
+        # Moving away from the disabled account works; moving back doesn't.
+        self.assertEqual(self.call(path, "PATCH", {"assignee_id": sam_user["id"]}, sam)[0], 200)
+        self.assertEqual(self.call(path, "PATCH", {"assignee_id": alex_user["id"]}, sam)[0], 400)
+
+    def test_assignable_users_visible_to_everyone(self):
+        _, sam = self.activate("sam", display_name="Sam Carter")
+        alex_user, _ = self.activate("alex", display_name="Alex Doe")
+        self.call(f"/api/users/{alex_user['id']}", "PATCH", {"disabled": True}, self.admin)
+        status, people, _ = self.call("/api/users/assignable", token=sam)
+        self.assertEqual(status, 200)
+        self.assertEqual([p["username"] for p in people], ["admin", "sam"])
+        self.assertEqual(set(people[0]), {"id", "username", "display_name"})
+        self.assertEqual(self.call("/api/users", token=sam)[0], 403)
+        self.assertEqual(self.call("/api/users/assignable", token=None)[0], 401)
+        self.assertEqual(self.call("/api/users/assignable", "POST", {}, sam)[0], 405)
+        # Admin user management is unaffected by the new route.
+        self.assertEqual(self.call("/api/users/assignable", token=self.admin)[0], 200)
+        self.assertEqual(self.call(f"/api/users/{alex_user['id']}", token=self.admin)[1]["username"], "alex")
+
     # --- startup and migration -------------------------------------------------
 
     def test_migrates_old_schema_database(self):
@@ -319,12 +408,22 @@ class ApiTests(unittest.TestCase):
         ticket = self.call("/api/tickets/42", token=token)[1]
         self.assertEqual((ticket["title"], ticket["requester"], ticket["requester_id"]), ("Legacy", "Alex", None))
         self.assertEqual((ticket["comments"][0]["author"], ticket["comments"][0]["body"]), ("Alex", "Existing update"))
+        self.assertIsNone(ticket["assignee"])
+        self.assertEqual(ticket["comments"][0]["kind"], "comment")
+        with closing(sqlite3.connect(Path(directory.name) / "triage.db")) as db:
+            self.assertIn("assignee_id", {row[1] for row in db.execute("PRAGMA table_info(tickets)")})
+            self.assertIn("kind", {row[1] for row in db.execute("PRAGMA table_info(comments)")})
+        admin_id = self.call("/api/me", token=token)[1]["id"]
+        self.assertEqual(self.call("/api/tickets/42", "PATCH", {"assignee_id": admin_id}, token)[1]["assignee"]["id"], admin_id)
+        self.assertEqual([t["id"] for t in self.call("/api/tickets?assignee=me", token=token)[1]], [42])
         new = self.call(method="POST", data=self.ticket(), token=token)[1]
         self.assertGreater(new["id"], 42)
         self.assertEqual(new["requester"], "admin")
         self.assertEqual(self.call("/api/tickets/42/comments", "POST", {"body": "Still here"}, token)[0], 201)
         self.restart()  # running the migration again is a no-op
-        self.assertEqual(len(self.call("/api/tickets/42", token=token)[1]["comments"]), 2)
+        legacy = self.call("/api/tickets/42", token=token)[1]
+        self.assertEqual(len(legacy["comments"]), 3)  # original, assignment activity, new update
+        self.assertEqual(legacy["assignee"]["id"], admin_id)
 
     def test_admin_password_required_on_first_start(self):
         env = {k: v for k, v in os.environ.items() if k not in ("ACCESS_PASSWORD", "ADMIN_PASSWORD", "DEV_MODE")}

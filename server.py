@@ -15,7 +15,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parent
 TYPES = ("Issue", "Request", "Change")
@@ -64,13 +64,21 @@ CREATE INDEX IF NOT EXISTS comments_ticket ON comments(ticket_id);
 MIGRATIONS = (
     ("tickets", "requester_id", "INTEGER REFERENCES users(id)"),
     ("comments", "author_id", "INTEGER REFERENCES users(id)"),
+    # Ticket assignment: one optional assignee per ticket.
+    ("tickets", "assignee_id", "INTEGER REFERENCES users(id)"),
+    # 'comment' for posted updates, 'system' for activity lines such as assignment changes.
+    ("comments", "kind", "TEXT NOT NULL DEFAULT 'comment'"),
 )
+POST_MIGRATION = "CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee_id);"
 TICKET_COLUMNS = ("t.id,t.title,t.description,t.type,t.priority,t.service,"
                   "COALESCE(u.display_name,t.requester) AS requester,t.requester_id,"
-                  "t.status,t.created,t.updated")
-TICKET_QUERY = f"SELECT {TICKET_COLUMNS} FROM tickets t LEFT JOIN users u ON u.id=t.requester_id"
+                  "t.status,t.created,t.updated,t.assignee_id,"
+                  "a.username AS assignee_username,a.display_name AS assignee_display_name,"
+                  "a.disabled AS assignee_disabled")
+TICKET_QUERY = (f"SELECT {TICKET_COLUMNS} FROM tickets t LEFT JOIN users u ON u.id=t.requester_id "
+                "LEFT JOIN users a ON a.id=t.assignee_id")
 COMMENT_QUERY = ("SELECT c.id,c.ticket_id,COALESCE(u.display_name,c.author) AS author,c.author_id,"
-                 "c.body,c.created FROM comments c LEFT JOIN users u ON u.id=c.author_id")
+                 "c.body,c.created,c.kind FROM comments c LEFT JOIN users u ON u.id=c.author_id")
 
 
 def now():
@@ -121,6 +129,40 @@ def public_user(row):
     return {"id": row["id"], "username": row["username"], "display_name": row["display_name"],
             "role": row["role"], "must_change": bool(row["must_change"]), "disabled": bool(row["disabled"]),
             "created": row["created"], "last_login": row["last_login"]}
+
+
+def ticket_json(row):
+    ticket = {k: row[k] for k in ("id", "title", "description", "type", "priority", "service", "requester",
+                                  "requester_id", "status", "created", "updated")}
+    ticket["assignee"] = None if row["assignee_id"] is None or row["assignee_username"] is None else {
+        "id": row["assignee_id"], "username": row["assignee_username"],
+        "display_name": row["assignee_display_name"], "disabled": bool(row["assignee_disabled"])}
+    return ticket
+
+
+def assignable_user(db, value):
+    """Validate a requested assignee id: None, or the id of an active account."""
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise RequestError(400, "assignee_id must be a user id or null.")
+    user = db.execute("SELECT * FROM users WHERE id=?", (value,)).fetchone()
+    if user is None:
+        raise RequestError(400, "That assignee doesn’t exist.")
+    if user["disabled"]:
+        raise RequestError(400, "Disabled accounts can’t be assigned tickets.")
+    return user
+
+
+def record_activity(db, ticket_id, actor, body, timestamp):
+    db.execute("INSERT INTO comments(ticket_id,author,author_id,body,created,kind) VALUES(?,?,?,?,?,'system')",
+               (ticket_id, actor["display_name"], actor["id"], body, timestamp))
+
+
+def assignment_activity(old_name, new):
+    if new is None:
+        return f"unassigned {old_name}" if old_name else "unassigned this"
+    return f"assigned this to {new['display_name']}"
 
 
 class Throttle:
@@ -416,6 +458,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.change_own_password(db, user)
         if user["must_change"]:
             raise RequestError(403, "Set a new password before continuing.", code="password_change_required")
+        if path == "/api/users/assignable":
+            if self.command != "GET":
+                raise RequestError(405, "Method not allowed")
+            rows = db.execute("SELECT id,username,display_name FROM users WHERE disabled=0 ORDER BY display_name COLLATE NOCASE, username")
+            return 200, [dict(r) for r in rows]
         if path == "/api/users" or path.startswith("/api/users/"):
             return self.users_api(db, path, user)
         return self.tickets_api(db, path, user)
@@ -423,16 +470,31 @@ class Handler(BaseHTTPRequestHandler):
     def tickets_api(self, db, path, user):
         if path == "/api/tickets":
             if self.command == "GET":
-                return 200, [dict(row) for row in db.execute(TICKET_QUERY + " ORDER BY t.updated DESC, t.id DESC")]
+                where, params = "", ()
+                assignee = parse_qs(urlsplit(self.path).query).get("assignee", [None])[-1]
+                if assignee == "none":
+                    where = " WHERE t.assignee_id IS NULL"
+                elif assignee == "me":
+                    where, params = " WHERE t.assignee_id=?", (user["id"],)
+                elif assignee is not None:
+                    if not re.fullmatch(r"[0-9]{1,18}", assignee):
+                        raise RequestError(400, "assignee must be a user id, me, or none.")
+                    where, params = " WHERE t.assignee_id=?", (int(assignee),)
+                rows = db.execute(TICKET_QUERY + where + " ORDER BY t.updated DESC, t.id DESC", params)
+                return 200, [ticket_json(row) for row in rows]
             if self.command == "POST":
                 x = self.body()
                 fields = {"title": 160, "description": 10000, "service": 80}
                 if not all(valid(x.get(k), limit) for k, limit in fields.items()) or x.get("type") not in TYPES or x.get("priority") not in PRIORITIES:
                     raise RequestError(400, "Complete all fields with valid values.")
+                assignee = assignable_user(db, x.get("assignee_id"))
                 timestamp = now()
-                cursor = db.execute("INSERT INTO tickets(title,description,type,priority,service,requester,requester_id,created,updated) VALUES(?,?,?,?,?,?,?,?,?)",
-                                    (x["title"].strip(), x["description"].strip(), x["type"], x["priority"], x["service"].strip(), user["display_name"], user["id"], timestamp, timestamp))
-                return 201, dict(db.execute(TICKET_QUERY + " WHERE t.id=?", (cursor.lastrowid,)).fetchone())
+                cursor = db.execute("INSERT INTO tickets(title,description,type,priority,service,requester,requester_id,assignee_id,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                                    (x["title"].strip(), x["description"].strip(), x["type"], x["priority"], x["service"].strip(), user["display_name"], user["id"],
+                                     assignee["id"] if assignee else None, timestamp, timestamp))
+                if assignee:
+                    record_activity(db, cursor.lastrowid, user, assignment_activity(None, assignee), timestamp)
+                return 201, ticket_json(db.execute(TICKET_QUERY + " WHERE t.id=?", (cursor.lastrowid,)).fetchone())
             raise RequestError(405, "Method not allowed")
         match = re.fullmatch(r"/api/tickets/([0-9]{1,18})(/comments)?", path)
         if not match:
@@ -442,15 +504,28 @@ class Handler(BaseHTTPRequestHandler):
         if row is None:
             raise RequestError(404, "Ticket not found")
         if self.command == "GET" and not match[2]:
-            ticket = dict(row)
-            ticket["comments"] = [dict(c) for c in db.execute(COMMENT_QUERY + " WHERE c.ticket_id=? ORDER BY c.id", (ticket_id,))]
-            return 200, ticket
+            return 200, self.ticket_detail(db, ticket_id)
         if self.command == "PATCH" and not match[2]:
+            # Partial update: any of status, priority, assignee_id.
             x = self.body()
-            if x.get("status") not in STATUSES or x.get("priority") not in PRIORITIES:
+            if not any(k in x for k in ("status", "priority", "assignee_id")):
+                raise RequestError(400, "Nothing to update: send status, priority, or assignee_id.")
+            status, priority = x.get("status", row["status"]), x.get("priority", row["priority"])
+            if status not in STATUSES or priority not in PRIORITIES:
                 raise RequestError(400, "Invalid status or priority")
-            db.execute("UPDATE tickets SET status=?,priority=?,updated=? WHERE id=?", (x["status"], x["priority"], now(), ticket_id))
-            return 200, {"ok": True}
+            assignee_id = row["assignee_id"]
+            timestamp = now()
+            requested = x.get("assignee_id")
+            if requested is not None and (not isinstance(requested, int) or isinstance(requested, bool)):
+                raise RequestError(400, "assignee_id must be a user id or null.")
+            # Re-sending the current assignee is a no-op, even if that account was disabled since.
+            if "assignee_id" in x and requested != row["assignee_id"]:
+                assignee = assignable_user(db, x["assignee_id"])
+                assignee_id = assignee["id"] if assignee else None
+                record_activity(db, ticket_id, user, assignment_activity(row["assignee_display_name"], assignee), timestamp)
+            db.execute("UPDATE tickets SET status=?,priority=?,assignee_id=?,updated=? WHERE id=?",
+                       (status, priority, assignee_id, timestamp, ticket_id))
+            return 200, self.ticket_detail(db, ticket_id)
         if self.command == "POST" and match[2]:
             x = self.body()
             if not valid(x.get("body"), 5000):
@@ -461,6 +536,11 @@ class Handler(BaseHTTPRequestHandler):
             db.execute("UPDATE tickets SET updated=? WHERE id=?", (timestamp, ticket_id))
             return 201, {"ok": True}
         raise RequestError(405, "Method not allowed")
+
+    def ticket_detail(self, db, ticket_id):
+        ticket = ticket_json(db.execute(TICKET_QUERY + " WHERE t.id=?", (ticket_id,)).fetchone())
+        ticket["comments"] = [dict(c) for c in db.execute(COMMENT_QUERY + " WHERE c.ticket_id=? ORDER BY c.id", (ticket_id,))]
+        return ticket
 
     do_GET = handle_request
     do_HEAD = handle_request
@@ -476,6 +556,7 @@ def migrate(db):
         if column not in {row[1] for row in db.execute(f"PRAGMA table_info({table})")}:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
             logging.info("Migrated database: added %s.%s", table, column)
+    db.executescript(POST_MIGRATION)
     db.commit()
 
 

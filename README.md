@@ -30,7 +30,7 @@ Everyone signs in with their own username and password. There is no self sign-up
 
 | | user | admin |
 |---|---|---|
-| See all tickets, create tickets, comment, change status and priority | ✓ | ✓ |
+| See all tickets, create tickets, comment, change status, priority and assignee | ✓ | ✓ |
 | Create accounts, reset passwords, change roles, disable or enable accounts | | ✓ |
 
 - **New accounts** get a username (2–32 characters: letters, digits, `.`, `-`, `_`; case-insensitive), a display name, a role, and a **temporary password**. At first sign-in the user must choose their own password before they can do anything else.
@@ -58,14 +58,14 @@ Passwords are hashed with scrypt (random salt per password) and must be 8–256 
 Stop the app and back up the data directory. Then delete the user rows. Tickets and comments are kept.
 
 ```sh
-sqlite3 data/triage.db "DELETE FROM sessions; DELETE FROM users;"
+sqlite3 data/triage.db "DELETE FROM sessions; UPDATE tickets SET assignee_id=NULL; DELETE FROM users;"
 ```
 
 Start again with `ADMIN_PASSWORD` set and a fresh admin is created. Re-create the other accounts. Their old tickets and comments still show the stored names.
 
 ## Upgrading from the shared-password version
 
-The database file, ticket IDs, Docker volume, and container user ID (1000) are unchanged. The schema is migrated in place on startup: new `users` and `sessions` tables are added, plus nullable `tickets.requester_id` and `comments.author_id` columns. No rows are rewritten. Back up the data directory first anyway.
+The database file, ticket IDs, Docker volume, and container user ID (1000) are unchanged. The schema is migrated in place on startup: new `users` and `sessions` tables are added, plus nullable `tickets.requester_id`, `tickets.assignee_id` and `comments.author_id` columns and a `comments.kind` column (default `comment`). No rows are rewritten. Databases from the first accounts release get the assignment columns the same way. Back up the data directory first anyway.
 
 1. Stop the old app.
 2. In `.env` (or your environment), replace `ACCESS_PASSWORD=…` with `ADMIN_PASSWORD=…` and optionally `ADMIN_USERNAME=…`. If `ACCESS_PASSWORD` is still set, it is **ignored** and a deprecation warning is logged.
@@ -82,8 +82,15 @@ API changes: the `requester` field on `POST /api/tickets` and the `author` field
 | `POST /api/logout` | signed in | Revokes the current token |
 | `GET /api/me` | signed in | Current user (`must_change` is true while on a temporary password) |
 | `POST /api/me/password` `{current_password,new_password}` | signed in | Clears `must_change`, signs out other sessions |
-| `GET/POST /api/tickets`, `GET/PATCH /api/tickets/:id`, `POST /api/tickets/:id/comments` | signed in | As before, minus self-reported names |
+| `GET /api/tickets?assignee=<id>\|me\|none` | signed in | All tickets, newest activity first; `assignee` is an optional filter (400 if it's anything else) |
+| `POST /api/tickets` `{title,description,service,priority,type,assignee_id?}` | signed in | → 201 ticket. You are the requester. `assignee_id` is a user id or `null` |
+| `GET /api/tickets/:id` | signed in | Ticket plus `comments` (each with `kind`: `comment` or `system`) |
+| `PATCH /api/tickets/:id` `{status?,priority?,assignee_id?}` | signed in | Partial update; send at least one field. → updated ticket with comments |
+| `POST /api/tickets/:id/comments` `{body}` | signed in | Posts an update as you |
+| `GET /api/users/assignable` | signed in | `[{id, username, display_name}]` of active accounts, for the assignee picker |
 | `GET/POST /api/users`, `GET/PATCH /api/users/:id` `{display_name?,role?,disabled?}`, `POST /api/users/:id/password` `{password}` | admin | 403 for users, 409 for duplicate username or last-admin protection |
+
+Every ticket object has `assignee`: either `null` or `{id, username, display_name, disabled}`.
 
 While `must_change` is true, everything except `/api/me`, `/api/me/password` and `/api/logout` returns 403 with `"code": "password_change_required"`. Cross-origin writes are rejected: a request whose `Origin` doesn't match its `Host` gets 403.
 
@@ -93,7 +100,26 @@ While `must_change` is true, everything except `/api/me`, `/api/me/password` and
 - **Requests:** ask for a service, media, access, or something new.
 - **Changes:** propose upgrades, maintenance, and improvements. Include impact, timing, and rollback details in the description.
 
-Create a ticket with a title, details, service, and priority. You are recorded as the requester. Open a ticket to move it through **Open → In progress → Waiting → Resolved**, adjust its priority, or post an update. Use **N** for a new ticket (a new user on the Users page) and **/** to search. Resolved tickets remain searchable and can be reopened. The app starts empty, with no fabricated service health or demo tickets.
+Create a ticket with a title, details, service, and priority. You are recorded as the requester. Open a ticket to move it through **Open → In progress → Waiting → Resolved**, adjust its priority, or post an update. Assign it to someone, or to yourself, so everyone knows who's on it. See [Assignment](#assignment) for the keyboard shortcuts. Resolved tickets remain searchable and can be reopened. The app starts empty, with no fabricated service health or demo tickets.
+
+## Assignment
+
+Each ticket has at most one **assignee**: an account, or nobody. Everyone can set, change, or clear the assignee on any ticket. Assignment uses the same shared ticket rights as status and priority.
+
+- Pick an assignee when you create a ticket, or change it in the ticket's detail view. **Assign to me** (or the **A** key while a ticket is open) takes it yourself.
+- Kanban cards and list rows show the assignee's initials. A dashed `–` means unassigned. The **Anyone / Assigned to me / Unassigned / <person>** filter sits next to the priority filter, and search also matches the assignee's name.
+- Only active accounts can be newly assigned. A disabled or nonexistent account gets a 400. Disabling an account keeps its existing assignments: they are shown greyed out as "(disabled)" until someone reassigns them.
+- Every assignment change is recorded on the ticket as a system activity line, such as "◈ admin assigned this to Haystack" or "◈ Sam unassigned Haystack". These lines appear in the conversation but don't count as comments. Status and priority changes are not logged.
+
+### Keyboard shortcuts
+
+| Key | Where | Action |
+|---|---|---|
+| `N` | anywhere | New ticket (new user on the Users page) |
+| `/` | ticket list | Focus search |
+| `A` | open ticket | Assign the ticket to me |
+
+Shortcuts are ignored while you type in a field.
 
 ## Storage and operations
 
@@ -103,4 +129,4 @@ SQLite uses WAL mode and parameterized queries. Back up the entire data director
 python3 -m unittest discover -s test -v
 ```
 
-The integration tests start the real server. They cover admin bootstrap, login and logout, wrong passwords and throttling, forced password change for temporary passwords, admin create, reset, role change, disable and enable, non-admins being refused user management, last-admin protection, session revocation, shared ticket rights (status, priority, comments), validation, cross-origin rejection, persistence across restarts, and migration of an old-schema database. Browser visual QA and Docker execution are not included.
+The integration tests start the real server. They cover admin bootstrap, login and logout, wrong passwords and throttling, forced password change for temporary passwords, admin create, reset, role change, disable and enable, non-admins being refused user management, last-admin protection, session revocation, shared ticket rights (status, priority, comments), assignment (on create, reassign, unassign, the `me`/`none`/id filters, disabled and nonexistent assignees, the assignable-user list vs. admin-only `/api/users`, activity lines), validation, cross-origin rejection, persistence across restarts, and migration of an old-schema database (including the new assignment columns). Browser visual QA and Docker execution are not included.
