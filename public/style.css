@@ -130,3 +130,9 @@ button.profile:hover #me-name{color:var(--accent-2)}
 /* Ticket view: wide enough for long descriptions and logs */
 #detail-dialog{width:min(1040px,94vw)}
 #detail-dialog .description,#detail-dialog .comment p{overflow-wrap:anywhere}
+
+/* Sortable ticket columns: click cycles ascending, descending, off */
+th .sort{background:none;border:0;padding:0;margin:0;font:inherit;letter-spacing:inherit;text-transform:inherit;color:inherit;cursor:pointer;display:inline-flex;align-items:center;gap:5px}
+th .sort:hover,th .sort.on{color:var(--text)}
+th .sort .sort-ind{font-size:9px;opacity:.45}
+th .sort.on .sort-ind{color:var(--accent);opacity:1}
