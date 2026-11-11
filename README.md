@@ -106,7 +106,8 @@ Create a ticket with a title, details, service, and priority. You are recorded a
 
 Each ticket has at most one **assignee**: an account, or nobody. Everyone can set, change, or clear the assignee on any ticket. Assignment uses the same shared ticket rights as status and priority.
 
-- Pick an assignee when you create a ticket, or change it in the ticket's detail view. **Assign to me** (or the **A** key while a ticket is open) takes it yourself.
+- Pick an assignee when you create a ticket, or change it in the ticket's detail view. **Assign to me** (or the **A** key while a ticket is open) selects yourself.
+- The ticket view has one **Save** button: it applies any status, priority or assignee change and posts the update text (optional) in one go. **Ctrl+Enter** in the update box saves too.
 - Kanban cards and list rows show the assignee's initials. A dashed `–` means unassigned. The **Anyone / Assigned to me / Unassigned / <person>** filter sits next to the priority filter, and search also matches the assignee's name.
 - Only active accounts can be newly assigned. A disabled or nonexistent account gets a 400. Disabling an account keeps its existing assignments: they are shown greyed out as "(disabled)" until someone reassigns them.
 - Every assignment change is recorded on the ticket as a system activity line, such as "◈ admin assigned this to Haystack" or "◈ Sam unassigned Haystack". These lines appear in the conversation but don't count as comments. Status and priority changes are not logged.
