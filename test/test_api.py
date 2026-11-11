@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -310,7 +311,7 @@ class ApiTests(unittest.TestCase):
         status, ticket, _ = self.call(method="POST", data={**self.ticket(), "assignee_id": alex_user["id"]}, token=sam)
         self.assertEqual(status, 201, ticket)
         self.assertEqual(ticket["assignee"], {"id": alex_user["id"], "username": "alex", "display_name": "Alex Doe", "disabled": False,
-                                              "color": alex_user["color"]})
+                                              "color": alex_user["color"], "is_bot": False})
         unassigned = self.call(method="POST", data=self.ticket(), token=sam)[1]
         self.assertIsNone(unassigned["assignee"])
         self.assertIsNone(self.call(method="POST", data={**self.ticket(), "assignee_id": None}, token=sam)[1]["assignee"])
@@ -384,7 +385,7 @@ class ApiTests(unittest.TestCase):
         status, people, _ = self.call("/api/users/assignable", token=sam)
         self.assertEqual(status, 200)
         self.assertEqual([p["username"] for p in people], ["admin", "sam"])
-        self.assertEqual(set(people[0]), {"id", "username", "display_name", "color"})
+        self.assertEqual(set(people[0]), {"id", "username", "display_name", "color", "is_bot"})
         self.assertEqual(self.call("/api/users", token=sam)[0], 403)
         self.assertEqual(self.call("/api/users/assignable", token=None)[0], 401)
         self.assertEqual(self.call("/api/users/assignable", "POST", {}, sam)[0], 405)
@@ -476,6 +477,255 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(people["alex"], "#445566")
         self.assertEqual(people["sam"], "#112233")
         self.assertRegex(people["admin"], r"^#[0-9a-f]{6}$")
+
+    # --- bots and API tokens -------------------------------------------------------
+
+    def create_bot(self, username="claude", display_name="Claude", **extra):
+        status, bot, _ = self.call("/api/users", "POST", {"username": username, "display_name": display_name, "bot": True, **extra}, self.admin)
+        self.assertEqual(status, 201, bot)
+        return bot
+
+    def mint(self, user_id, name="agent", token=None):
+        status, data, _ = self.call(f"/api/users/{user_id}/tokens", "POST", {"name": name}, token or self.admin)
+        self.assertEqual(status, 201, data)
+        return data
+
+    def admin_cli(self, *args):
+        env = {**os.environ, "DATA_DIR": self.directory.name}
+        return subprocess.run([sys.executable, "server.py", "admin", *args], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+
+    def dt(self, *args, token=None, stdin=None, **env):
+        environment = {k: v for k, v in os.environ.items() if not k.startswith("DT_")}
+        environment.update({"DT_URL": self.base, "DT_TOKEN": token or "", "DT_TOKEN_FILE": str(Path(self.directory.name) / "missing-token")}, **env)
+        return subprocess.run([sys.executable, str(ROOT / "tools" / "dt.py"), *args], env=environment,
+                              input=stdin, capture_output=True, text=True, timeout=30)
+
+    def test_api_token_auth_and_revocation(self):
+        bot = self.create_bot()
+        self.assertEqual((bot["is_bot"], bot["role"], bot["must_change"]), (True, "user", False))
+        minted = self.mint(bot["id"], "a0-nix claude-code")
+        token = minted["token"]
+        self.assertRegex(token, r"^dt_[A-Za-z0-9_-]{40,}$")
+        self.assertEqual(set(minted), {"id", "name", "created", "last_used", "token"})
+        self.assertIsNone(minted["last_used"])
+        # The token works on every endpoint with the bot's own permissions.
+        me = self.call("/api/me", token=token)[1]
+        self.assertEqual((me["username"], me["is_bot"]), ("claude", True))
+        status, ticket, _ = self.call(method="POST", data=self.ticket(), token=token)
+        self.assertEqual(status, 201, ticket)
+        self.assertEqual((ticket["requester"], ticket["requester_is_bot"]), ("Claude", True))
+        self.assertEqual(self.call(f"/api/tickets/{ticket['id']}/comments", "POST", {"body": "Filed by an agent"}, token)[0], 201)
+        self.assertTrue(self.call(f"/api/tickets/{ticket['id']}", token=token)[1]["comments"][0]["author_is_bot"])
+        self.assertEqual(self.call("/api/users", token=token)[0], 403)  # not an admin
+        # Bots are assignable like anyone.
+        people = {p["username"]: p for p in self.call("/api/users/assignable", token=self.admin)[1]}
+        self.assertTrue(people["claude"]["is_bot"])
+        assigned = self.call(f"/api/tickets/{ticket['id']}", "PATCH", {"assignee_id": bot["id"]}, self.admin)[1]
+        self.assertEqual((assigned["assignee"]["username"], assigned["assignee"]["is_bot"]), ("claude", True))
+        # Only the hash is stored; listing never shows the token.
+        with closing(sqlite3.connect(Path(self.directory.name) / "triage.db")) as db:
+            stored = db.execute("SELECT token_hash FROM api_tokens").fetchall()
+        self.assertNotIn(token, str(stored))
+        listed = self.call(f"/api/users/{bot['id']}/tokens", token=self.admin)[1]
+        self.assertEqual([t["name"] for t in listed], ["a0-nix claude-code"])
+        self.assertNotIn("token", listed[0])
+        # Names are unique among active tokens.
+        self.assertEqual(self.call(f"/api/users/{bot['id']}/tokens", "POST", {"name": "a0-nix claude-code"}, self.admin)[0], 409)
+        self.assertEqual(self.call(f"/api/users/{bot['id']}/tokens", "POST", {"name": " "}, self.admin)[0], 400)
+        # Revocation takes effect immediately.
+        path = f"/api/users/{bot['id']}/tokens/{minted['id']}"
+        self.assertEqual(self.call(path, "DELETE", token=self.admin)[0], 200)
+        status, data, _ = self.call("/api/me", token=token)
+        self.assertEqual(status, 401)
+        self.assertIn("revoked", data["error"])
+        self.assertEqual(self.call(path, "DELETE", token=self.admin)[0], 404)
+        self.assertEqual(self.call(f"/api/users/{bot['id']}/tokens", token=self.admin)[1], [])
+        self.mint(bot["id"], "a0-nix claude-code")  # the name is free again
+        self.assertEqual(self.call(token="dt_" + "x" * 43)[0], 401)
+        # Session tokens keep working as before.
+        self.assertEqual(self.call("/api/me", token=self.admin)[0], 200)
+
+    def test_token_last_used_updates(self):
+        bot = self.create_bot()
+        token = self.mint(bot["id"])["token"]
+        self.call("/api/me", token=token)
+        first = self.call(f"/api/users/{bot['id']}/tokens", token=self.admin)[1][0]["last_used"]
+        self.assertIsNotNone(first)
+        time.sleep(0.01)
+        self.call(token=token)
+        second = self.call(f"/api/users/{bot['id']}/tokens", token=self.admin)[1][0]["last_used"]
+        self.assertGreater(second, first)
+
+    def test_bot_cannot_sign_in_with_a_password(self):
+        bot = self.create_bot()
+        # Same answer as an unknown username: no hint that the account exists.
+        unknown = self.login("nobody-here", "whatever-password", expect=401)
+        refused = self.login("claude", "whatever-password", expect=401)
+        self.assertEqual(refused["error"], unknown["error"])
+        self.assertEqual(self.login("claude", "!bot", expect=401)["error"], unknown["error"])
+        # Throttling treats it like any unknown username, too.
+        for _ in range(3):  # five failures in total, as for any username
+            self.login("claude", "whatever-password", expect=401)
+        self.login("claude", "whatever-password", expect=429)
+        path = f"/api/users/{bot['id']}"
+        self.assertEqual(self.call(path + "/password", "POST", {"password": "some-password-1"}, self.admin)[0], 400)
+        self.assertEqual(self.call(path, "PATCH", {"role": "admin"}, self.admin)[0], 400)
+        self.assertEqual(self.call("/api/users", "POST", {"username": "evil", "display_name": "Evil", "bot": True, "role": "admin"}, self.admin)[0], 400)
+        self.assertEqual(self.call("/api/users", "POST", {"username": "evil", "display_name": "Evil", "bot": "yes"}, self.admin)[0], 400)
+        # Through its token, a bot can't change a password or sign out a token.
+        token = self.mint(bot["id"])["token"]
+        self.assertEqual(self.call("/api/me/password", "POST", {"current_password": "x", "new_password": "long-enough-1"}, token)[0], 403)
+        self.assertEqual(self.call("/api/logout", "POST", {}, token)[0], 400)
+        self.assertEqual(self.call("/api/me", token=token)[0], 200)
+
+    def test_disabled_bot_tokens_rejected(self):
+        bot = self.create_bot()
+        token = self.mint(bot["id"])["token"]
+        self.assertEqual(self.call(token=token)[0], 200)
+        self.assertEqual(self.call(f"/api/users/{bot['id']}", "PATCH", {"disabled": True}, self.admin)[0], 200)
+        status, data, _ = self.call(token=token)
+        self.assertEqual(status, 401)
+        self.assertIn("disabled", data["error"])
+        self.assertEqual(self.call(f"/api/users/{bot['id']}", "PATCH", {"disabled": False}, self.admin)[0], 200)
+        self.assertEqual(self.call(token=token)[0], 200)
+
+    def test_token_management_permissions(self):
+        sam_user, sam = self.activate("sam")
+        alex_user, _ = self.activate("alex")
+        bot = self.create_bot()
+        for user_id in (alex_user["id"], bot["id"], sam_user["id"]):
+            self.assertEqual(self.call(f"/api/users/{user_id}/tokens", "POST", {"name": "x"}, sam)[0], 403)
+            self.assertEqual(self.call(f"/api/users/{user_id}/tokens", token=sam)[0], 403)
+        admin_token = self.mint(bot["id"], "keep")
+        self.assertEqual(self.call(f"/api/users/{bot['id']}/tokens/{admin_token['id']}", "DELETE", token=sam)[0], 403)
+        # Users manage their own tokens through /api/me/tokens.
+        status, mine, _ = self.call("/api/me/tokens", "POST", {"name": "laptop"}, sam)
+        self.assertEqual(status, 201, mine)
+        self.assertEqual(self.call("/api/me", token=mine["token"])[1]["username"], "sam")
+        self.assertEqual([t["name"] for t in self.call("/api/me/tokens", token=sam)[1]], ["laptop"])
+        # Someone else's token id can't be revoked through /api/me/tokens.
+        self.assertEqual(self.call(f"/api/me/tokens/{admin_token['id']}", "DELETE", token=sam)[0], 404)
+        self.assertEqual(self.call("/api/me", token=admin_token["token"])[0], 200)
+        # An API token can't mint more tokens, for itself or anyone.
+        self.assertEqual(self.call("/api/me/tokens", "POST", {"name": "more"}, mine["token"])[0], 403)
+        self.assertEqual(self.call("/api/me/tokens", token=mine["token"])[0], 403)
+        self.assertEqual(self.call("/api/me/tokens/1", "PUT", {}, sam)[0], 405)
+        self.assertEqual(self.call(f"/api/me/tokens/{mine['id']}", "DELETE", token=sam)[0], 200)
+        self.assertEqual(self.call("/api/me", token=mine["token"])[0], 401)
+        # The cross-origin check still applies to token requests; requests without Origin (CLI) are fine.
+        other = self.call("/api/me/tokens", "POST", {"name": "laptop"}, sam)[1]["token"]
+        self.assertEqual(self.call(method="POST", data=self.ticket(), token=other, headers={"Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(self.call(method="POST", data=self.ticket(), token=other)[0], 201)
+        # Disabling a person's account stops their tokens too.
+        self.call(f"/api/users/{sam_user['id']}", "PATCH", {"disabled": True}, self.admin)
+        self.assertEqual(self.call("/api/me", token=other)[0], 401)
+
+    def test_admin_cli(self):
+        # Runs against the live database while the server is up.
+        result = self.admin_cli("create-user", "--username", "Claude", "--display-name", "Claude", "--bot", "--color", "#F70997")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Created bot 'claude'", result.stdout)
+        again = self.admin_cli("create-user", "--username", "claude", "--display-name", "Someone else")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("already exists", again.stdout)
+        result = self.admin_cli("create-token", "--username", "claude", "--name", "a0-nix")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        token = result.stdout.strip()
+        self.assertEqual(result.stdout, token + "\n")  # only the token on stdout
+        me = self.call("/api/me", token=token)[1]
+        self.assertEqual((me["username"], me["display_name"], me["is_bot"], me["color"]), ("claude", "Claude", True, "#f70997"))
+        self.assertEqual(self.admin_cli("create-token", "--username", "claude", "--name", "a0-nix").returncode, 1)  # duplicate name
+        listing = self.admin_cli("list-users")
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        line = next(l for l in listing.stdout.splitlines() if " claude " in l)
+        self.assertIn("bot", line)
+        self.assertRegex(line, r"active\s+1\s")
+        revoked = self.admin_cli("revoke-token", "--username", "claude", "--name", "a0-nix")
+        self.assertEqual(revoked.returncode, 0, revoked.stderr)
+        self.assertEqual(self.call("/api/me", token=token)[0], 401)
+        self.assertEqual(self.admin_cli("revoke-token", "--username", "claude", "--name", "a0-nix").returncode, 1)
+        missing = self.admin_cli("create-token", "--username", "ghost", "--name", "x")
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("no user named", missing.stderr)
+        self.assertEqual(missing.stdout, "")
+        self.assertEqual(self.admin_cli("create-user", "--username", "x", "--bot").returncode, 1)  # invalid username
+        self.assertEqual(self.admin_cli("create-user", "--username", "rootbot", "--bot", "--role", "admin").returncode, 1)
+        self.assertEqual(self.admin_cli("create-user", "--username", "badcolor", "--color", "pink").returncode, 1)
+        self.assertNotEqual(self.admin_cli("bogus").returncode, 0)
+        # A human account gets a temporary password it must change.
+        human = self.admin_cli("create-user", "--username", "haystack", "--display-name", "Haystack", "--role", "admin")
+        self.assertEqual(human.returncode, 0, human.stderr)
+        temporary = human.stdout.split("Temporary password: ")[1].split()[0]
+        token = self.login("haystack", temporary)
+        me = self.call("/api/me", token=token)[1]
+        self.assertEqual((me["role"], me["must_change"], me["is_bot"]), ("admin", True, False))
+        # Without a database, commands other than create-user refuse to guess.
+        with tempfile.TemporaryDirectory() as empty:
+            env = {**os.environ, "DATA_DIR": empty}
+            result = subprocess.run([sys.executable, "server.py", "admin", "list-users"], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("no database", result.stderr)
+
+    def test_dt_client_end_to_end(self):
+        bot = self.create_bot()
+        token = self.mint(bot["id"])["token"]
+        sam_user, _ = self.activate("sam", display_name="Sam Carter")
+        who = self.dt("whoami", token=token)
+        self.assertEqual(who.returncode, 0, who.stderr)
+        self.assertIn("Claude (@claude, bot", who.stdout)
+        created = self.dt("new", "--title", "Plex buffering", "--description-file", "-", "--service", "Plex",
+                          "--type", "request", "--priority", "high", "--assignee", "sam", token=token, stdin="Line one\nLine two\n")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        label, url = created.stdout.split()
+        self.assertRegex(label, r"^DT-\d{3}$")
+        self.assertEqual(url, f"{self.base}/#{label}")
+        ticket_id = int(label[3:])
+        ticket = self.call(f"/api/tickets/{ticket_id}", token=self.admin)[1]
+        self.assertEqual((ticket["type"], ticket["priority"], ticket["service"], ticket["requester"], ticket["assignee"]["id"]),
+                         ("Request", "High", "Plex", "Claude", sam_user["id"]))
+        self.assertEqual(ticket["description"], "Line one\nLine two")
+        listed = self.dt("list", token=token)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn(label, listed.stdout)
+        self.assertIn("Sam Carter", listed.stdout)
+        as_json = json.loads(self.dt("list", "--json", "--mine", token=token).stdout)
+        self.assertEqual([t["id"] for t in as_json], [ticket_id])
+        self.assertEqual(json.loads(self.dt("list", "--json", "--assignee", "sam", token=token).stdout)[0]["id"], ticket_id)
+        self.assertEqual(json.loads(self.dt("list", "--json", "--assignee", "me", token=token).stdout), [])
+        commented = self.dt("comment", label.lower(), "--body", "-", token=token, stdin="Looked at the logs.")
+        self.assertEqual(commented.returncode, 0, commented.stderr)
+        updated = self.dt("update", str(ticket_id), "--status", "in-progress", "--assignee", "me", "--priority", "Critical", token=token)
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertIn("In progress", updated.stdout)
+        shown = self.dt("show", label, token=token)
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        for text in ("Plex buffering", "Status: In progress", "Priority: Critical", "Claude [bot]", "Looked at the logs.", "Line two"):
+            self.assertIn(text, shown.stdout)
+        detail = json.loads(self.dt("show", label, "--json", token=token).stdout)
+        self.assertEqual((detail["status"], detail["assignee"]["username"]), ("In progress", "claude"))
+        self.assertEqual(json.loads(self.dt("list", "--json", "--status", "in progress", token=token).stdout)[0]["id"], ticket_id)
+        self.assertEqual(self.dt("update", label, "--status", "Resolved", token=token).returncode, 0)
+        self.assertEqual(json.loads(self.dt("list", "--json", token=token).stdout), [])  # unresolved by default
+        self.assertEqual(len(json.loads(self.dt("list", "--json", "--all", token=token).stdout)), 1)
+        # Errors: clear messages and distinct exit codes.
+        missing = self.dt("show", "DT-999", token=token)
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("Ticket not found", missing.stderr)
+        self.assertEqual(self.dt("update", label, token=token).returncode, 2)
+        self.assertEqual(self.dt("new", "--title", "x", "--service", "y", token=token).returncode, 2)  # no description
+        self.assertEqual(self.dt("new", "--title", "x", "--description", "y", "--service", "z", "--priority", "urgent", token=token).returncode, 2)
+        self.assertEqual(self.dt("update", label, "--assignee", "ghost", token=token).returncode, 1)
+        bad = self.dt("whoami", token="dt_not-a-real-token")
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("HTTP 401", bad.stderr)
+        self.assertEqual(self.dt("whoami").returncode, 2)  # no token configured
+        token_file = Path(self.directory.name) / "token"
+        token_file.write_text(token + "\n")
+        token_file.chmod(0o600)
+        self.assertEqual(self.dt("whoami", DT_TOKEN_FILE=str(token_file)).returncode, 0)
+        unreachable = self.dt("whoami", token=token, DT_URL="http://127.0.0.1:9")
+        self.assertEqual(unreachable.returncode, 3)
+        self.assertIn("can't reach", unreachable.stderr)
 
     # --- startup and migration -------------------------------------------------
 

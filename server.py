@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -61,7 +62,16 @@ CREATE TABLE IF NOT EXISTS sessions (
  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  created INTEGER NOT NULL, expires INTEGER NOT NULL, last_seen INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS api_tokens (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+ created TEXT NOT NULL, last_used TEXT, revoked INTEGER NOT NULL DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS api_tokens_user ON api_tokens(user_id);
+-- Token names are unique per account among the tokens that still work.
+CREATE UNIQUE INDEX IF NOT EXISTS api_tokens_active_name ON api_tokens(user_id, name) WHERE revoked=0;
 CREATE INDEX IF NOT EXISTS comments_ticket ON comments(ticket_id);
 """
 # Columns added after the shared-password version. Existing rows keep NULL ids
@@ -75,18 +85,24 @@ MIGRATIONS = (
     ("comments", "kind", "TEXT NOT NULL DEFAULT 'comment'"),
     # Per-user avatar color ('#rrggbb'); NULL means the default derived from the username.
     ("users", "color", "TEXT"),
+    # Bot accounts (AI agents, scripts): no password, API tokens only.
+    ("users", "is_bot", "INTEGER NOT NULL DEFAULT 0"),
 )
+TOKEN_PREFIX = "dt_"
+BOT_PASSWORD_HASH = "!bot"  # never matches: bots can't sign in with a password
 POST_MIGRATION = "CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee_id);"
 TICKET_COLUMNS = ("t.id,t.title,t.description,t.type,t.priority,t.service,"
                   "COALESCE(u.display_name,t.requester) AS requester,t.requester_id,"
                   "t.status,t.created,t.updated,t.assignee_id,"
                   "a.username AS assignee_username,a.display_name AS assignee_display_name,"
                   "a.disabled AS assignee_disabled,a.color AS assignee_color,"
-                  "u.username AS requester_username,u.color AS requester_custom_color")
+                  "u.username AS requester_username,u.color AS requester_custom_color,"
+                  "u.is_bot AS requester_is_bot,a.is_bot AS assignee_is_bot")
 TICKET_QUERY = (f"SELECT {TICKET_COLUMNS} FROM tickets t LEFT JOIN users u ON u.id=t.requester_id "
                 "LEFT JOIN users a ON a.id=t.assignee_id")
 COMMENT_QUERY = ("SELECT c.id,c.ticket_id,COALESCE(u.display_name,c.author) AS author,c.author_id,"
-                 "c.body,c.created,c.kind,u.username AS author_username,u.color AS author_custom_color "
+                 "c.body,c.created,c.kind,u.username AS author_username,u.color AS author_custom_color,"
+                 "u.is_bot AS author_is_bot "
                  "FROM comments c LEFT JOIN users u ON u.id=c.author_id")
 
 
@@ -157,7 +173,12 @@ def public_user(row):
     return {"id": row["id"], "username": row["username"], "display_name": row["display_name"],
             "role": row["role"], "must_change": bool(row["must_change"]), "disabled": bool(row["disabled"]),
             "created": row["created"], "last_login": row["last_login"],
-            "color": effective_color(row["color"], row["username"]), "custom_color": row["color"]}
+            "color": effective_color(row["color"], row["username"]), "custom_color": row["color"],
+            "is_bot": bool(row["is_bot"])}
+
+
+def token_json(row):
+    return {"id": row["id"], "name": row["name"], "created": row["created"], "last_used": row["last_used"]}
 
 
 def ticket_json(row):
@@ -165,17 +186,61 @@ def ticket_json(row):
                                   "requester_id", "status", "created", "updated")}
     # Legacy tickets without an account fall back to the stored requester name.
     ticket["requester_color"] = effective_color(row["requester_custom_color"], row["requester_username"] or row["requester"])
+    ticket["requester_is_bot"] = bool(row["requester_is_bot"])
     ticket["assignee"] = None if row["assignee_id"] is None or row["assignee_username"] is None else {
         "id": row["assignee_id"], "username": row["assignee_username"],
         "display_name": row["assignee_display_name"], "disabled": bool(row["assignee_disabled"]),
-        "color": effective_color(row["assignee_color"], row["assignee_username"])}
+        "color": effective_color(row["assignee_color"], row["assignee_username"]),
+        "is_bot": bool(row["assignee_is_bot"])}
     return ticket
 
 
 def comment_json(row):
     comment = {k: row[k] for k in ("id", "ticket_id", "author", "author_id", "body", "created", "kind")}
     comment["author_color"] = effective_color(row["author_custom_color"], row["author_username"] or row["author"])
+    comment["author_is_bot"] = bool(row["author_is_bot"])
     return comment
+
+
+def create_account(db, username, display_name, role, password=None, bot=False, color=None):
+    """Validate and insert an account; shared by the API and the admin CLI. Returns the new id.
+    Humans get a temporary password (must_change); bots get no usable password."""
+    username = username.strip().lower() if isinstance(username, str) else ""
+    if not USERNAME_RE.fullmatch(username):
+        raise RequestError(400, "Usernames are 2–32 characters: letters, digits, dot, dash, underscore.")
+    if not valid(display_name, 80):
+        raise RequestError(400, "Enter a display name (up to 80 characters).")
+    if role not in ROLES:
+        raise RequestError(400, "Role must be admin or user.")
+    if bot and role != "user":
+        raise RequestError(400, "Bot accounts always have the user role.")
+    if not bot:
+        problem = password_problem(password, username)
+        if problem:
+            raise RequestError(400, problem)
+    color = parse_color(color)
+    timestamp = now()
+    try:
+        cursor = db.execute("INSERT INTO users(username,display_name,role,password_hash,must_change,is_bot,color,created,updated) "
+                            "VALUES(?,?,?,?,?,?,?,?,?)",
+                            (username, display_name.strip(), role, BOT_PASSWORD_HASH if bot else hash_password(password),
+                             0 if bot else 1, int(bool(bot)), color, timestamp, timestamp))
+    except sqlite3.IntegrityError:
+        raise RequestError(409, "That username is already taken.") from None
+    return cursor.lastrowid
+
+
+def mint_token(db, user_id, name):
+    """Create an API token. Only its SHA-256 is stored; the plain token is returned once."""
+    if not valid(name, 60):
+        raise RequestError(400, "Give the token a name (up to 60 characters).")
+    token = TOKEN_PREFIX + secrets.token_urlsafe(32)
+    try:
+        cursor = db.execute("INSERT INTO api_tokens(user_id,name,token_hash,created) VALUES(?,?,?,?)",
+                            (user_id, name.strip(), token_hash(token), now()))
+    except sqlite3.IntegrityError:
+        raise RequestError(409, "An active token with that name already exists. Revoke it or pick another name.") from None
+    return token, db.execute("SELECT * FROM api_tokens WHERE id=?", (cursor.lastrowid,)).fetchone()
 
 
 def assignable_user(db, value):
@@ -266,6 +331,12 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(content)
 
     def body(self):
+        # Parsed once per request: routes that dispatch further may ask again.
+        if getattr(self, "parsed_body", None) is None:
+            self.parsed_body = self.read_body()
+        return self.parsed_body
+
+    def read_body(self):
         if self.headers.get("Transfer-Encoding"):
             raise RequestError(400, "Transfer-Encoding is not supported")
         try:
@@ -341,7 +412,8 @@ class Handler(BaseHTTPRequestHandler):
         if wait:
             raise RequestError(429, f"Too many failed sign-ins. Try again in {wait} seconds.", {"Retry-After": str(wait)})
         user = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-        if not verify_password(password, user["password_hash"] if user else DUMMY_HASH) or user is None:
+        human = user is not None and not user["is_bot"]
+        if not verify_password(password, user["password_hash"] if human else DUMMY_HASH) or not human:
             self.server.user_throttle.fail(user_key)
             self.server.ip_throttle.fail(ip_key)
             raise RequestError(401, "That username and password didn’t match.")
@@ -362,6 +434,9 @@ class Handler(BaseHTTPRequestHandler):
         token = header[7:].strip() if header.startswith("Bearer ") else ""
         if not token or len(token) > 256:
             raise RequestError(401, "Sign in to continue.")
+        self.api_token_id = None
+        if token.startswith(TOKEN_PREFIX):
+            return self.authenticate_api_token(db, token)
         self.token_hash = token_hash(token)
         row = db.execute("SELECT user_id,expires,last_seen FROM sessions WHERE token_hash=?", (self.token_hash,)).fetchone()
         moment = int(time.time())
@@ -375,7 +450,42 @@ class Handler(BaseHTTPRequestHandler):
                        (moment + SESSION_TTL, moment, self.token_hash))
         return user
 
+    def authenticate_api_token(self, db, token):
+        row = db.execute("SELECT id,user_id FROM api_tokens WHERE token_hash=? AND revoked=0", (token_hash(token),)).fetchone()
+        if row is None:
+            raise RequestError(401, "That API token is invalid or has been revoked.")
+        user = db.execute("SELECT * FROM users WHERE id=?", (row["user_id"],)).fetchone()
+        if user is None or user["disabled"]:
+            raise RequestError(401, "The account for this API token is disabled.")
+        self.token_hash, self.api_token_id = None, row["id"]
+        db.execute("UPDATE api_tokens SET last_used=? WHERE id=?", (now(), row["id"]))
+        return user
+
+    def require_session(self, action):
+        # A leaked API token must not be able to mint more tokens or take over the password.
+        if self.api_token_id is not None:
+            raise RequestError(403, f"{action} needs a signed-in browser session, not an API token.")
+
+    def tokens_api(self, db, owner, token_id):
+        self.require_session("Managing API tokens")
+        if token_id is None:
+            if self.command == "GET":
+                rows = db.execute("SELECT * FROM api_tokens WHERE user_id=? AND revoked=0 ORDER BY id", (owner["id"],))
+                return 200, [token_json(r) for r in rows]
+            if self.command == "POST":
+                token, row = mint_token(db, owner["id"], self.body().get("name"))
+                return 201, {**token_json(row), "token": token}
+            raise RequestError(405, "Method not allowed")
+        if self.command != "DELETE":
+            raise RequestError(405, "Method not allowed")
+        if db.execute("UPDATE api_tokens SET revoked=1 WHERE id=? AND user_id=? AND revoked=0", (token_id, owner["id"])).rowcount == 0:
+            raise RequestError(404, "Token not found")
+        return 200, {"ok": True}
+
     def change_own_password(self, db, user):
+        self.require_session("Changing a password")
+        if user["is_bot"]:
+            raise RequestError(400, "Bot accounts don’t have passwords.")
         x = self.body()
         current, new = x.get("current_password"), x.get("new_password")
         wait = self.server.user_throttle.retry_after(user["username"])
@@ -416,25 +526,16 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, [public_user(r) for r in db.execute("SELECT * FROM users ORDER BY username")]
             if self.command == "POST":
                 x = self.body()
-                username = x.get("username").strip().lower() if isinstance(x.get("username"), str) else ""
-                if not USERNAME_RE.fullmatch(username):
-                    raise RequestError(400, "Usernames are 2–32 characters: letters, digits, dot, dash, underscore.")
-                if not valid(x.get("display_name"), 80):
-                    raise RequestError(400, "Enter a display name (up to 80 characters).")
-                if x.get("role") not in ROLES:
-                    raise RequestError(400, "Role must be admin or user.")
-                problem = password_problem(x.get("password"), username)
-                if problem:
-                    raise RequestError(400, problem)
-                timestamp = now()
-                try:
-                    cursor = db.execute("INSERT INTO users(username,display_name,role,password_hash,must_change,created,updated) VALUES(?,?,?,?,1,?,?)",
-                                        (username, x["display_name"].strip(), x["role"], hash_password(x["password"]), timestamp, timestamp))
-                except sqlite3.IntegrityError:
-                    raise RequestError(409, "That username is already taken.") from None
-                return 201, public_user(db.execute("SELECT * FROM users WHERE id=?", (cursor.lastrowid,)).fetchone())
+                bot = x.get("bot", False)
+                if not isinstance(bot, bool):
+                    raise RequestError(400, "bot must be true or false.")
+                # Bots get no password and the user role unless a role is explicitly (and wrongly) requested.
+                user_id = create_account(db, x.get("username"), x.get("display_name"),
+                                         x.get("role", "user") if bot else x.get("role"),
+                                         None if bot else x.get("password"), bot=bot, color=x.get("color"))
+                return 201, public_user(db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
             raise RequestError(405, "Method not allowed")
-        match = re.fullmatch(r"/api/users/([0-9]{1,18})(/password)?", path)
+        match = re.fullmatch(r"/api/users/([0-9]{1,18})(/password|/tokens(?:/([0-9]{1,18}))?)?", path)
         if not match:
             raise RequestError(404, "Endpoint not found")
         user_id = int(match[1])
@@ -445,9 +546,13 @@ class Handler(BaseHTTPRequestHandler):
         target = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if target is None:
             raise RequestError(404, "User not found")
+        if match[2] and match[2].startswith("/tokens"):
+            return self.tokens_api(db, target, int(match[3]) if match[3] else None)
         if match[2]:
             if self.command != "POST":
                 raise RequestError(405, "Method not allowed")
+            if target["is_bot"]:
+                raise RequestError(400, "Bot accounts don’t have passwords. Manage their API tokens instead.")
             password = x.get("password")
             problem = password_problem(password, target["username"])
             if problem:
@@ -468,6 +573,8 @@ class Handler(BaseHTTPRequestHandler):
             raise RequestError(400, "Enter a display name (up to 80 characters).")
         if role not in ROLES:
             raise RequestError(400, "Role must be admin or user.")
+        if target["is_bot"] and role != "user":
+            raise RequestError(400, "Bot accounts always have the user role.")
         if not isinstance(disabled, bool):
             raise RequestError(400, "disabled must be true or false.")
         if disabled and user_id == admin["id"]:
@@ -499,6 +606,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/logout":
             if self.command != "POST":
                 raise RequestError(405, "Method not allowed")
+            if self.api_token_id is not None:
+                raise RequestError(400, "API tokens don’t sign out. Revoke the token instead.")
             db.execute("DELETE FROM sessions WHERE token_hash=?", (self.token_hash,))
             return 200, {"ok": True}
         if path == "/api/me/password":
@@ -507,12 +616,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.change_own_password(db, user)
         if user["must_change"]:
             raise RequestError(403, "Set a new password before continuing.", code="password_change_required")
+        me_tokens = re.fullmatch(r"/api/me/tokens(?:/([0-9]{1,18}))?", path)
+        if me_tokens:
+            return self.tokens_api(db, user, int(me_tokens[1]) if me_tokens[1] else None)
         if path == "/api/users/assignable":
             if self.command != "GET":
                 raise RequestError(405, "Method not allowed")
-            rows = db.execute("SELECT id,username,display_name,color FROM users WHERE disabled=0 ORDER BY display_name COLLATE NOCASE, username")
+            rows = db.execute("SELECT id,username,display_name,color,is_bot FROM users WHERE disabled=0 ORDER BY display_name COLLATE NOCASE, username")
             return 200, [{"id": r["id"], "username": r["username"], "display_name": r["display_name"],
-                          "color": effective_color(r["color"], r["username"])} for r in rows]
+                          "color": effective_color(r["color"], r["username"]), "is_bot": bool(r["is_bot"])} for r in rows]
         if path == "/api/users" or path.startswith("/api/users/"):
             return self.users_api(db, path, user)
         return self.tickets_api(db, path, user)
@@ -649,7 +761,92 @@ def create_server(host="0.0.0.0", port=3000, data_dir="data", admin_username="ad
     return server
 
 
+def admin_cli(argv):
+    """Host-side account management: `python server.py admin <command>`. Safe while the server runs (WAL)."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="python server.py admin",
+                                     description="Manage dark-triage accounts and API tokens without the web UI.")
+    parser.add_argument("--data-dir", default=os.environ.get("DATA_DIR", "data"),
+                        help="directory holding triage.db (default: $DATA_DIR or ./data)")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    create = commands.add_parser("create-user", help="create an account (no-op if the username exists)")
+    create.add_argument("--username", required=True)
+    create.add_argument("--display-name", help="defaults to the username")
+    create.add_argument("--role", choices=ROLES, default="user")
+    create.add_argument("--bot", action="store_true", help="API-token-only account, e.g. for an AI agent")
+    create.add_argument("--color", help="avatar color as #rrggbb")
+    mint = commands.add_parser("create-token", help="create an API token and print it (only) on stdout")
+    mint.add_argument("--username", required=True)
+    mint.add_argument("--name", required=True, help="label, e.g. the host or agent using it")
+    commands.add_parser("list-users", help="list accounts and their active tokens")
+    revoke = commands.add_parser("revoke-token", help="revoke a user's active token by name")
+    revoke.add_argument("--username", required=True)
+    revoke.add_argument("--name", required=True)
+    args = parser.parse_args(argv)
+    fail = lambda message: (print(f"error: {message}", file=sys.stderr), 1)[1]
+
+    database = Path(args.data_dir) / "triage.db"
+    if not database.exists():
+        if args.command != "create-user":
+            return fail(f"no database at {database}. Check DATA_DIR or start the server once.")
+        database.parent.mkdir(parents=True, exist_ok=True)
+        print(f"note: creating a new database at {database}", file=sys.stderr)
+    with closing(sqlite3.connect(database, timeout=15)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        migrate(db)
+        find = lambda name: db.execute("SELECT * FROM users WHERE username=?", (name.strip().lower(),)).fetchone()
+        try:
+            with db:
+                if args.command == "create-user":
+                    existing = find(args.username)
+                    if existing:
+                        kind = "bot" if existing["is_bot"] else existing["role"]
+                        print(f"User '{existing['username']}' already exists (id {existing['id']}, {kind}); nothing changed.")
+                        return 0
+                    password = None if args.bot else secrets.token_urlsafe(12)
+                    user_id = create_account(db, args.username, args.display_name or args.username.strip().lower(),
+                                             args.role, password, bot=args.bot, color=args.color)
+                    print(f"Created {'bot' if args.bot else args.role} '{args.username.strip().lower()}' (id {user_id}).")
+                    if password:
+                        print(f"Temporary password: {password}  (they must choose their own at first sign-in)")
+                    return 0
+                if args.command == "list-users":
+                    rows = db.execute("SELECT u.*, (SELECT COUNT(*) FROM api_tokens t WHERE t.user_id=u.id AND t.revoked=0) AS tokens, "
+                                      "(SELECT MAX(last_used) FROM api_tokens t WHERE t.user_id=u.id) AS token_used "
+                                      "FROM users u ORDER BY u.username").fetchall()
+                    table = [("ID", "USERNAME", "DISPLAY NAME", "KIND", "STATUS", "TOKENS", "LAST ACTIVITY")]
+                    for r in rows:
+                        status = "disabled" if r["disabled"] else "temp-password" if r["must_change"] else "active"
+                        table.append((str(r["id"]), r["username"], r["display_name"], "bot" if r["is_bot"] else r["role"],
+                                      status, str(r["tokens"]), max(r["last_login"] or "", r["token_used"] or "") or "never"))
+                    widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
+                    for row in table:
+                        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+                    return 0
+                user = find(args.username)
+                if user is None:
+                    return fail(f"no user named '{args.username}'.")
+                if args.command == "create-token":
+                    token, _ = mint_token(db, user["id"], args.name)
+                    if user["disabled"]:
+                        print("note: this account is disabled; the token works once it is enabled again.", file=sys.stderr)
+                    print(token)
+                    return 0
+                revoked = db.execute("UPDATE api_tokens SET revoked=1 WHERE user_id=? AND name=? AND revoked=0",
+                                     (user["id"], args.name.strip())).rowcount
+                if not revoked:
+                    return fail(f"'{user['username']}' has no active token named '{args.name}'.")
+                print(f"Revoked token '{args.name.strip()}' of '{user['username']}'.")
+                return 0
+        except RequestError as exc:
+            return fail(exc.message)
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "admin":
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+        raise SystemExit(admin_cli(sys.argv[2:]))
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     if os.environ.get("ACCESS_PASSWORD"):
         logging.warning("ACCESS_PASSWORD is deprecated and ignored: dark-triage now uses user accounts. "

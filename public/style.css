@@ -74,3 +74,19 @@ nav .nav-label{margin-top:22px}
 .color-input::-moz-color-swatch{border:0;border-radius:50%}
 .color-cell{display:flex;align-items:center;gap:8px}
 .color-cell small{font-size:12px}
+/* bots and API tokens */
+.bot-badge{display:inline-block;font:10px ui-monospace,monospace;letter-spacing:.4px;color:var(--accent-2);border:1px solid rgba(33,226,215,.35);border-radius:3px;padding:0 4px;margin-left:5px;line-height:15px;vertical-align:1px;font-weight:400}
+.profile-actions{display:grid;grid-template-columns:1fr auto;align-items:center}
+.color-toggle{flex-basis:auto}
+#side-tokens{text-align:right}
+.heading-actions{display:flex;gap:10px;align-items:center}
+.heading-actions .secondary>span{color:var(--accent-2)}
+.token-reveal{border:1px solid rgba(33,226,215,.35);background:rgba(33,226,215,.05);border-radius:8px;padding:2px 12px 12px;margin:16px 0}
+.token-reveal input{font-size:13px;color:var(--accent-2)}
+.token-table{margin-top:16px;border:1px solid var(--border);border-radius:7px;font-size:13px}
+.token-table td,.token-table th{padding:9px 10px}
+.token-table td:first-child,.token-table th:first-child{padding-left:12px;word-break:break-word}
+.token-table tbody tr{cursor:default}
+#tokens-dialog code{font:12px ui-monospace,monospace;color:var(--text-2)}
+#tokens-dialog .inline-field .primary{white-space:nowrap}
+@media(max-width:760px){.heading-actions{flex-direction:column;align-items:stretch;margin-top:24px}.page-heading .heading-actions .primary{margin-top:0}}
