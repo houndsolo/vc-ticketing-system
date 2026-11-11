@@ -2,7 +2,7 @@
 
 A little chaos. A lot more clarity.
 
-A self-hosted helpdesk for your homelab and friends, built with Python's standard library and SQLite. No Node.js, npm, pip packages, or build step. The browser uses plain HTML, CSS, and JavaScript. A dark interface with hot-pink and cyan accents, responsive layouts, a list and kanban board, live search, priority and status filters, and keyboard shortcuts.
+A self-hosted helpdesk for your homelab and friends, built with Python's standard library and SQLite. No Node.js, npm, pip packages, or build step. Optionally it stores its data in PostgreSQL instead (one pip package, see [Storage backends](#storage-backends)). The browser uses plain HTML, CSS, and JavaScript. A dark interface with hot-pink and cyan accents, responsive layouts, a list and kanban board, live search, priority and status filters, and keyboard shortcuts.
 
 ## Run with Docker
 
@@ -18,7 +18,7 @@ For access outside your LAN, use a trusted VPN or an HTTPS reverse proxy. Forwar
 
 ## Run with Python
 
-Requires Python 3.11+ with SQLite support. No third-party dependencies or installation step.
+Requires Python 3.11+ with SQLite support. No third-party dependencies or installation step. Only the optional PostgreSQL backend needs `psycopg` (`pip install 'psycopg[binary]==3.3.8'`).
 
 ```sh
 ADMIN_PASSWORD='your-long-random-password' python3 server.py
@@ -68,7 +68,7 @@ Users page (admin): **New bot** takes a username and a display name, then opens 
 
 ### Or with the admin CLI on the server host
 
-`server.py admin` manages accounts and tokens directly in the database. It reads `DATA_DIR` like the server, and it is safe to run while the server is up (SQLite WAL).
+`server.py admin` manages accounts and tokens directly in the database. It reads `DATABASE_URL` and `DATA_DIR` like the server (PostgreSQL if `DATABASE_URL` is set, else SQLite), and it is safe to run while the server is up.
 
 ```sh
 # Docker / Podman: run inside the container
@@ -86,7 +86,8 @@ DATA_DIR=/path/to/data python3 server.py admin list-users
 - `create-token --username U --name N` prints only the token on stdout, so it can be redirected straight into a file. Token names are unique among a user's active tokens.
 - `list-users` shows kind (admin, user or bot), status, active token count and last activity.
 - `revoke-token --username U --name N` revokes that active token.
-- Errors go to stderr with exit code 1. Commands other than `create-user` refuse to run if there is no database at `DATA_DIR`, which usually means a wrong path.
+- `import-sqlite --from PATH [--force]` copies a SQLite database into PostgreSQL. See [Storage backends](#storage-backends).
+- Errors go to stderr with exit code 1. Commands other than `create-user` refuse to run if there is no database at `DATA_DIR` (or no dark-triage tables at `DATABASE_URL`), which usually means a wrong path.
 
 ### The `dt` command-line client
 
@@ -139,7 +140,8 @@ Requests without an `Origin` header (CLI tools) are fine. Requests whose `Origin
 | `DEV_MODE` | unset | `1` relaxes the `ADMIN_PASSWORD` requirement for local development: a random admin password is generated and printed to the log. Never use it in production. |
 | `TRUST_PROXY` | unset | `1` takes the client IP for login throttling from the last `X-Forwarded-For` entry. Set it only behind your own reverse proxy. |
 | `PORT` | `3000` | Listening port. |
-| `DATA_DIR` | `data` | Directory holding `triage.db`. |
+| `DATA_DIR` | `data` | Directory holding `triage.db` (SQLite). |
+| `DATABASE_URL` | unset | `postgresql://user:pass@host:5432/db?sslmode=require&connect_timeout=5` stores everything in PostgreSQL instead of SQLite. See [Storage backends](#storage-backends). |
 
 ### Lost the last admin password?
 
@@ -148,6 +150,8 @@ Stop the app and back up the data directory. Then delete the user rows. Tickets 
 ```sh
 sqlite3 data/triage.db "DELETE FROM sessions; UPDATE tickets SET assignee_id=NULL; DELETE FROM users;"
 ```
+
+On PostgreSQL, run the same statements with `psql "$DATABASE_URL" -c '…'`.
 
 Start again with `ADMIN_PASSWORD` set and a fresh admin is created. Re-create the other accounts. Their old tickets and comments still show the stored names.
 
@@ -166,6 +170,7 @@ API changes: the `requester` field on `POST /api/tickets` and the `author` field
 
 | Method & path | Who | Notes |
 |---|---|---|
+| `GET /api/health` | anyone | `200 {"ok":true,"db":"sqlite"\|"postgres"}` when a trivial query works, else `503 {"ok":false,…}`. For keepalived, load balancers and blackbox probes |
 | `POST /api/login` `{username,password}` | anyone | → `{token, expires_in, user}`; 401 bad credentials, 403 disabled, 429 throttled (`Retry-After`) |
 | `POST /api/logout` | signed in | Revokes the current token |
 | `GET /api/me` | signed in | Current user (`must_change` is true while on a temporary password) |
@@ -217,12 +222,71 @@ Each ticket has at most one **assignee**: an account, or nobody. Everyone can se
 
 Shortcuts are ignored while you type in a field.
 
-## Storage and operations
+## Storage backends
 
-SQLite uses WAL mode and parameterized queries. Back up the entire data directory while the app is stopped (or use SQLite's online backup tooling). Never delete the Docker volume unless you intend to delete all tickets and accounts.
+| | SQLite (default) | PostgreSQL |
+|---|---|---|
+| Selected by | `DATABASE_URL` unset or empty | `DATABASE_URL=postgresql://…` |
+| Data | `DATA_DIR/triage.db` (WAL mode) | the database in the URL |
+| Dependencies | none | `psycopg[binary]==3.3.8` (in the Docker image; imported only when `DATABASE_URL` is set) |
+| Instances | one | one or more, stateless, e.g. behind a VIP |
+
+Both backends use the same schema, the same add-only migrations, parameterized queries and the same JSON API: timestamps stay ISO text (`2026-11-11T09:30:00.000Z`) and session times epoch seconds, flags stay `0`/`1` integers. The dialect differences are kept in two small places in `server.py` (`DIALECTS` and the `Connection` class): `?` vs `%s` placeholders, `AUTOINCREMENT` vs identity columns, `lastrowid` vs `RETURNING id`, `COLLATE NOCASE` vs a unique index on `lower(username)` for case-insensitive usernames, and no `PRAGMA`s on PostgreSQL.
+
+### PostgreSQL
+
+```sh
+DATABASE_URL='postgresql://triage:secret@10.0.0.10:5432/triage?sslmode=require&connect_timeout=5' python3 server.py
+```
+
+- Create an empty database and a role that owns it. The server creates the tables on first start, then bootstraps the admin from `ADMIN_PASSWORD` if there are no accounts, exactly as with SQLite.
+- `connect_timeout` defaults to 5 seconds if the URL doesn't set one. Put the URL in the environment (`.env`, a Quadlet `EnvironmentFile`, a secret), not on a command line: it contains the password. The server only ever logs `host:port/dbname`.
+- `DATA_DIR` isn't used for data on PostgreSQL. Keep the volume mounted while migrating so `import-sqlite` can read the old file.
+
+### Moving from SQLite to PostgreSQL
+
+`import-sqlite` copies users, sessions, API tokens, tickets and comments from a SQLite file into the PostgreSQL database at `DATABASE_URL`, keeping every id, then resets the identity sequences so new rows continue after the highest id. Sign-ins and API tokens keep working. Old-schema SQLite files are fine: they're brought up to date in memory first, and the file itself is only read (a consistent snapshot, even while a server is writing to it).
+
+```sh
+# Inside the container, with DATABASE_URL in its environment:
+podman exec dark-triage python server.py admin import-sqlite --from /app/data/triage.db
+# → Imported /app/data/triage.db into 10.0.0.10:5432/triage: users 4, api_tokens 2, sessions 3, tickets 12, comments 40
+```
+
+- The target must be empty: it refuses if it already has users or tickets. If the server already started on the new database and created the bootstrap admin, the target isn't empty: `--force` **deletes everything in the target** and then imports. Use it only on a database you've just created.
+- It's one transaction: it imports everything or nothing. It isn't idempotent, so run it once.
+- Suggested order: stop writes (or accept losing anything written after the copy), run the import, point the app at `DATABASE_URL`, restart. Keep `triage.db` as a backup.
+
+### Health endpoint
+
+`GET /api/health` needs no sign-in. It opens a connection and runs `SELECT 1`: `200 {"ok":true,"db":"postgres"}` (or `"sqlite"`), or `503 {"ok":false,"db":"postgres"}` when that fails. Point keepalived `track_script`, a load balancer or a blackbox exporter at it.
+
+### Running several instances (HA)
+
+- **Stateless app.** Every request opens its own database connection (with `connect_timeout`) and closes it. Nothing is cached between requests, so any instance can serve any request, and sessions and API tokens work on all of them.
+- **Failover.** If the database connection is lost mid-request (for example, a Patroni failover moves the VIP), that request fails cleanly with `503` and `Retry-After: 5`. Its transaction isn't committed. The next request connects again, to the new primary. No restart needed.
+- **Safe startup.** Schema creation, migrations, the first-admin bootstrap and `import-sqlite` run under a PostgreSQL advisory lock (`pg_advisory_xact_lock`, fixed key `0x64747269616765`). Instances starting together on one database wait for each other, and only one admin is created. Admin user management (the last-admin check) is serialized across instances by a second advisory lock, as `BEGIN IMMEDIATE` does on SQLite.
+- **Login throttling is per process.** The failed-sign-in counters are in memory, so with N instances an attacker can get up to N times the attempts before backoff, and the counters reset on restart. Use sticky routing (or a single active instance behind the VIP) if that matters.
+
+### Backups
+
+- **SQLite:** back up the entire data directory while the app is stopped (or use SQLite's online backup tooling). Never delete the Docker volume unless you intend to delete all tickets and accounts.
+- **PostgreSQL:** `pg_dump` the database, or rely on the cluster's backups.
+
+## Tests
 
 ```sh
 python3 -m unittest discover -s test -v
 ```
 
-The integration tests start the real server. They cover admin bootstrap, login and logout, wrong passwords and throttling, forced password change for temporary passwords, admin create, reset, role change, disable and enable, non-admins being refused user management, last-admin protection, session revocation, shared ticket rights (status, priority, comments), assignment (on create, reassign, unassign, the `me`/`none`/id filters, disabled and nonexistent assignees, the assignable-user list vs. admin-only `/api/users`, activity lines), validation, cross-origin rejection, persistence across restarts, display-name changes via `PATCH /api/me` (valid, invalid, shown on tickets and comments), avatar colors (deterministic valid defaults, set and reset your own, strict validation, admin-only changes to others, colors in tickets, comments, activity lines and the assignable list), bots and API tokens (token auth on every endpoint, revocation, `last_used`, bot password login refused like an unknown user, disabled bots' tokens rejected, non-admins can't manage other accounts' tokens, `/api/me/tokens`, tokens can't mint tokens, cross-origin check with tokens), the admin CLI (run as a subprocess against the live test database), the `dt` client end to end (`whoami`, `new`, `list`, `show`, `comment`, `update`, error exit codes), and migration of an old-schema database and of an accounts database without `users.color`. Browser visual QA and Docker execution are not included.
+The suite runs on SQLite with no dependencies. To run the same suite on PostgreSQL, set `TEST_DATABASE_URL` to a server where the role may `CREATE DATABASE`. Each test gets a fresh database there, dropped afterwards. With nix, for example:
+
+```sh
+nix-shell -p postgresql_17 'python3.withPackages(ps:[ps.psycopg])' --run '
+  d=$(mktemp -d); initdb -D $d -U postgres --auth=trust >/dev/null
+  pg_ctl -D $d -l $d/log -o "-p 54329 -c unix_socket_directories= -c listen_addresses=127.0.0.1" -w start
+  TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:54329/postgres python3 -m unittest discover -s test -v
+  pg_ctl -D $d stop; rm -rf $d'
+```
+
+The integration tests start the real server. They cover admin bootstrap, login and logout, wrong passwords and throttling, forced password change for temporary passwords, admin create, reset, role change, disable and enable, non-admins being refused user management, last-admin protection, session revocation, shared ticket rights (status, priority, comments), assignment (on create, reassign, unassign, the `me`/`none`/id filters, disabled and nonexistent assignees, the assignable-user list vs. admin-only `/api/users`, activity lines), validation, cross-origin rejection, persistence across restarts, display-name changes via `PATCH /api/me` (valid, invalid, shown on tickets and comments), avatar colors (deterministic valid defaults, set and reset your own, strict validation, admin-only changes to others, colors in tickets, comments, activity lines and the assignable list), bots and API tokens (token auth on every endpoint, revocation, `last_used`, bot password login refused like an unknown user, disabled bots' tokens rejected, non-admins can't manage other accounts' tokens, `/api/me/tokens`, tokens can't mint tokens, cross-origin check with tokens), the admin CLI (run as a subprocess against the live test database), the `dt` client end to end (`whoami`, `new`, `list`, `show`, `comment`, `update`, error exit codes), migration of an old-schema database and of an accounts database without `users.color` (on either backend), `/api/health` (and, on PostgreSQL, 503s during a database outage followed by recovery without a restart), two instances starting together on one empty database (on PostgreSQL, also that both wait while the migration lock is held), case-insensitive unique usernames (including mixed-case rows written directly), and `import-sqlite` (a populated SQLite database copied while its server runs, with identical API output, working sessions and tokens and continuing ids afterwards; an old-schema file; refusal of a non-empty target and `--force`). Browser visual QA and Docker execution are not included.

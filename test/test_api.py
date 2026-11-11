@@ -1,8 +1,14 @@
+"""Integration tests. They run on SQLite by default. With TEST_DATABASE_URL set to a PostgreSQL
+server (a role that may CREATE DATABASE, e.g. postgresql://postgres@127.0.0.1:5432/postgres),
+every test gets its own new database there and the server runs with DATABASE_URL."""
+
 from contextlib import closing
 import json
 import os
 from pathlib import Path
 import re
+import secrets
+import select
 import sqlite3
 import subprocess
 import sys
@@ -10,10 +16,35 @@ import tempfile
 import time
 import unittest
 from urllib.error import HTTPError
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 ADMIN_PASSWORD = "bootstrap-admin-pw"
+PG_URL = os.environ.get("TEST_DATABASE_URL")
+if PG_URL:
+    import psycopg
+DB_ERRORS = (sqlite3.Error, psycopg.Error) if PG_URL else (sqlite3.Error,)
+sys.path.insert(0, str(ROOT))
+import server  # noqa: E402  (constants and helpers only; the server under test is a subprocess)
+sys.path.remove(str(ROOT))
+
+
+def pg_database_url(name):
+    parts = urlsplit(PG_URL)
+    return urlunsplit(parts._replace(path="/" + name))
+
+
+def create_pg_database():
+    name = "dt_test_" + secrets.token_hex(6)
+    with psycopg.connect(PG_URL, autocommit=True) as admin:
+        admin.execute(f"CREATE DATABASE {name}")
+    return name
+
+
+def drop_pg_database(name):
+    with psycopg.connect(PG_URL, autocommit=True) as admin:
+        admin.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
 
 # The schema of the shared-password version, used to test in-place migration.
 OLD_SCHEMA = """
@@ -31,18 +62,60 @@ CREATE TABLE comments (
 """
 
 
+def clean_env():
+    return {k: v for k, v in os.environ.items()
+            if k not in ("ACCESS_PASSWORD", "DEV_MODE", "ADMIN_USERNAME", "ADMIN_PASSWORD", "TRUST_PROXY", "DATABASE_URL", "DATA_DIR")}
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
+        self.backend = self.fresh_backend()
+        self.directory = self.backend["directory"]
         self.process = None
         self.start()
         self.admin = self.login("admin", ADMIN_PASSWORD)
 
+    # --- backend helpers ---------------------------------------------------------
+
+    def fresh_backend(self):
+        """A new, empty database: a temp DATA_DIR, plus (on PostgreSQL) a new database."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        env = {"DATA_DIR": directory.name}
+        if PG_URL:
+            name = create_pg_database()
+            self.addCleanup(drop_pg_database, name)  # runs after tearDown has stopped the server
+            env["DATABASE_URL"] = pg_database_url(name)
+        return {"directory": directory, "env": env}
+
+    def backend_env(self, backend=None):
+        return dict((backend or self.backend)["env"])
+
+    def sql(self, query, params=(), backend=None):
+        """Run one statement against the test's database (committed); returns all rows as tuples."""
+        env = self.backend_env(backend)
+        if "DATABASE_URL" in env:
+            with psycopg.connect(env["DATABASE_URL"], autocommit=True) as db:
+                cursor = db.execute(query.replace("?", "%s"), params)
+                return cursor.fetchall() if cursor.description else []
+        with closing(sqlite3.connect(Path(env["DATA_DIR"]) / "triage.db")) as db, db:
+            return db.execute(query, params).fetchall()
+
+    def columns(self, table, backend=None):
+        if PG_URL:
+            return {r[0] for r in self.sql("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=?",
+                                           (table,), backend=backend)}
+        return {r[1] for r in self.sql(f"PRAGMA table_info({table})", backend=backend)}
+
+    def spawn(self, env):
+        return subprocess.Popen([sys.executable, "server.py"], cwd=ROOT, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
     def start(self, **extra_env):
-        env = {k: v for k, v in os.environ.items() if k not in ("ACCESS_PASSWORD", "DEV_MODE", "ADMIN_USERNAME", "TRUST_PROXY")}
-        env.update({"PORT": "0", "DATA_DIR": self.directory.name, "ADMIN_PASSWORD": ADMIN_PASSWORD}, **extra_env)
-        self.process = subprocess.Popen([sys.executable, "server.py"], cwd=ROOT,
-                                        env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        env = clean_env()
+        env.update(self.backend_env(), PORT="0", ADMIN_PASSWORD=ADMIN_PASSWORD)
+        env.update(extra_env)
+        self.process = self.spawn(env)
         line = self.process.stdout.readline()
         self.assertIn("listening on port", line)
         self.base = "http://127.0.0.1:" + line.split()[-1]
@@ -60,7 +133,6 @@ class ApiTests(unittest.TestCase):
 
     def tearDown(self):
         self.stop()
-        self.directory.cleanup()
 
     def call(self, path="/api/tickets", method="GET", data=None, token=None, headers=None, raw=None):
         request_headers = {"Content-Type": "application/json"}
@@ -114,9 +186,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.call("/api/me", token=second)[0], 401)
         self.assertEqual(self.call("/api/me", token=self.admin)[0], 200)
         # Tokens are stored hashed, never in plain text.
-        with closing(sqlite3.connect(Path(self.directory.name) / "triage.db")) as db:
-            stored = [row[0] for row in db.execute("SELECT token_hash FROM sessions")]
-            password_hash = db.execute("SELECT password_hash FROM users").fetchone()[0]
+        stored = [row[0] for row in self.sql("SELECT token_hash FROM sessions")]
+        password_hash = self.sql("SELECT password_hash FROM users")[0][0]
         self.assertNotIn(self.admin, stored)
         self.assertTrue(password_hash.startswith("scrypt$"))
         self.assertNotIn(ADMIN_PASSWORD, password_hash)
@@ -396,11 +467,6 @@ class ApiTests(unittest.TestCase):
     # --- avatar colors -----------------------------------------------------------
 
     def test_default_color_is_deterministic_and_valid(self):
-        sys.path.insert(0, str(ROOT))
-        try:
-            import server
-        finally:
-            sys.path.remove(str(ROOT))
         me = self.call("/api/me", token=self.admin)[1]
         self.assertIsNone(me["custom_color"])
         self.assertRegex(me["color"], r"^#[0-9a-f]{6}$")
@@ -518,8 +584,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 201, data)
         return data
 
-    def admin_cli(self, *args):
-        env = {**os.environ, "DATA_DIR": self.directory.name}
+    def admin_cli(self, *args, backend=None, **extra_env):
+        env = {**clean_env(), **self.backend_env(backend), **extra_env}
         return subprocess.run([sys.executable, "server.py", "admin", *args], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
 
     def dt(self, *args, token=None, stdin=None, **env):
@@ -551,8 +617,7 @@ class ApiTests(unittest.TestCase):
         assigned = self.call(f"/api/tickets/{ticket['id']}", "PATCH", {"assignee_id": bot["id"]}, self.admin)[1]
         self.assertEqual((assigned["assignee"]["username"], assigned["assignee"]["is_bot"]), ("claude", True))
         # Only the hash is stored; listing never shows the token.
-        with closing(sqlite3.connect(Path(self.directory.name) / "triage.db")) as db:
-            stored = db.execute("SELECT token_hash FROM api_tokens").fetchall()
+        stored = self.sql("SELECT token_hash FROM api_tokens")
         self.assertNotIn(token, str(stored))
         listed = self.call(f"/api/users/{bot['id']}/tokens", token=self.admin)[1]
         self.assertEqual([t["name"] for t in listed], ["a0-nix claude-code"])
@@ -688,11 +753,9 @@ class ApiTests(unittest.TestCase):
         me = self.call("/api/me", token=token)[1]
         self.assertEqual((me["role"], me["must_change"], me["is_bot"]), ("admin", True, False))
         # Without a database, commands other than create-user refuse to guess.
-        with tempfile.TemporaryDirectory() as empty:
-            env = {**os.environ, "DATA_DIR": empty}
-            result = subprocess.run([sys.executable, "server.py", "admin", "list-users"], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("no database", result.stderr)
+        result = self.admin_cli("list-users", backend=self.fresh_backend())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no database", result.stderr)
 
     def test_dt_client_end_to_end(self):
         bot = self.create_bot()
@@ -759,14 +822,17 @@ class ApiTests(unittest.TestCase):
 
     def test_migrates_old_schema_database(self):
         self.stop()
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.directory, original = directory, self.directory
-        self.addCleanup(original.cleanup)
-        with closing(sqlite3.connect(Path(directory.name) / "triage.db")) as db, db:
-            db.executescript(OLD_SCHEMA)
-            db.execute("INSERT INTO tickets(id,title,description,type,priority,service,requester,status,created,updated) VALUES(42,'Legacy','Keep me','Change','Low','Storage','Alex','Waiting','2026-11-07T12:00:00.000Z','2026-11-07T12:00:00.000Z')")
-            db.execute("INSERT INTO comments(ticket_id,author,body,created) VALUES(42,'Alex','Existing update','2026-11-07T12:00:00.000Z')")
+        self.backend = self.fresh_backend()
+        old_schema = OLD_SCHEMA
+        if PG_URL:  # the same add-only migration path, from an old-schema PostgreSQL database
+            old_schema = OLD_SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", server.DIALECTS["postgres"]["id"])
+        for statement in old_schema.split(";"):
+            if statement.strip():
+                self.sql(statement)
+        self.sql("INSERT INTO tickets(id,title,description,type,priority,service,requester,status,created,updated) VALUES(42,'Legacy','Keep me','Change','Low','Storage','Alex','Waiting','2026-11-07T12:00:00.000Z','2026-11-07T12:00:00.000Z')")
+        self.sql("INSERT INTO comments(ticket_id,author,body,created) VALUES(42,'Alex','Existing update','2026-11-07T12:00:00.000Z')")
+        if PG_URL:  # explicit ids don't advance an identity sequence (import-sqlite resets it the same way)
+            self.sql("SELECT setval(pg_get_serial_sequence('tickets', 'id'), 42)")
         self.start(ACCESS_PASSWORD="old-shared-password")  # deprecated and ignored
         self.assertEqual(self.call(headers={"Authorization": "Bearer old-shared-password"})[0], 401)
         token = self.login("admin", ADMIN_PASSWORD)
@@ -778,10 +844,9 @@ class ApiTests(unittest.TestCase):
         # Legacy rows without an account get the default color of their stored name.
         self.assertRegex(ticket["requester_color"], r"^#[0-9a-f]{6}$")
         self.assertEqual(ticket["requester_color"], ticket["comments"][0]["author_color"])  # both "Alex"
-        with closing(sqlite3.connect(Path(directory.name) / "triage.db")) as db:
-            self.assertIn("assignee_id", {row[1] for row in db.execute("PRAGMA table_info(tickets)")})
-            self.assertIn("kind", {row[1] for row in db.execute("PRAGMA table_info(comments)")})
-            self.assertIn("color", {row[1] for row in db.execute("PRAGMA table_info(users)")})
+        self.assertIn("assignee_id", self.columns("tickets"))
+        self.assertIn("kind", self.columns("comments"))
+        self.assertIn("color", self.columns("users"))
         admin_id = self.call("/api/me", token=token)[1]["id"]
         self.assertEqual(self.call("/api/tickets/42", "PATCH", {"assignee_id": admin_id}, token)[1]["assignee"]["id"], admin_id)
         self.assertEqual([t["id"] for t in self.call("/api/tickets?assignee=me", token=token)[1]], [42])
@@ -798,12 +863,10 @@ class ApiTests(unittest.TestCase):
         user, token = self.activate("sam", display_name="Sam Carter")
         ticket = self.call(method="POST", data=self.ticket(), token=token)[1]
         self.stop()
-        with closing(sqlite3.connect(Path(self.directory.name) / "triage.db")) as db, db:
-            db.execute("ALTER TABLE users DROP COLUMN color")  # the schema before avatar colors
+        self.sql("ALTER TABLE users DROP COLUMN color")  # the schema before avatar colors
         self.start()
-        with closing(sqlite3.connect(Path(self.directory.name) / "triage.db")) as db:
-            self.assertIn("color", {row[1] for row in db.execute("PRAGMA table_info(users)")})
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM users WHERE color IS NULL").fetchone()[0], 2)
+        self.assertIn("color", self.columns("users"))
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM users WHERE color IS NULL")[0][0], 2)
         # Sessions, accounts and tickets survive; everyone gets their default color.
         me = self.call("/api/me", token=token)[1]
         self.assertEqual((me["username"], me["color"], me["custom_color"]), ("sam", user["color"], None))
@@ -811,38 +874,219 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.call("/api/me", "PATCH", {"color": "#abcdef"}, token)[1]["color"], "#abcdef")
 
     def test_admin_password_required_on_first_start(self):
-        env = {k: v for k, v in os.environ.items() if k not in ("ACCESS_PASSWORD", "ADMIN_PASSWORD", "DEV_MODE")}
-        with tempfile.TemporaryDirectory() as empty:
-            result = subprocess.run([sys.executable, "server.py"], cwd=ROOT, env={**env, "DATA_DIR": empty, "PORT": "0"},
-                                    capture_output=True, timeout=10)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(b"Set ADMIN_PASSWORD", result.stderr)
-            short = subprocess.run([sys.executable, "server.py"], cwd=ROOT, env={**env, "DATA_DIR": empty, "PORT": "0", "ADMIN_PASSWORD": "short"},
-                                   capture_output=True, timeout=10)
-            self.assertNotEqual(short.returncode, 0)
-            self.assertFalse((Path(empty) / "triage.db").exists() and self.count_users(empty))
+        empty = self.fresh_backend()
+        env = {**clean_env(), **self.backend_env(empty), "PORT": "0"}
+        result = subprocess.run([sys.executable, "server.py"], cwd=ROOT, env=env, capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"Set ADMIN_PASSWORD", result.stderr)
+        short = subprocess.run([sys.executable, "server.py"], cwd=ROOT, env={**env, "ADMIN_PASSWORD": "short"},
+                               capture_output=True, timeout=10)
+        self.assertNotEqual(short.returncode, 0)
+        self.assertEqual(self.count_users(empty), 0)
         # Once an account exists, ADMIN_PASSWORD is no longer needed.
         self.restart(ADMIN_PASSWORD="")
         self.login("admin", ADMIN_PASSWORD)
 
     def test_custom_admin_username_and_dev_mode(self):
-        with tempfile.TemporaryDirectory() as empty:
-            env = {k: v for k, v in os.environ.items() if k not in ("ACCESS_PASSWORD", "ADMIN_PASSWORD")}
-            process = subprocess.Popen([sys.executable, "server.py"], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       env={**env, "DATA_DIR": empty, "PORT": "0", "DEV_MODE": "1", "ADMIN_USERNAME": "Root.Ops"})
-            try:
-                self.assertIn("listening on port", process.stdout.readline())
-            finally:
-                process.terminate()
-                _, stderr = process.communicate(timeout=5)
-            self.assertIn("generated password", stderr)
-            with closing(sqlite3.connect(Path(empty) / "triage.db")) as db:
-                self.assertEqual(db.execute("SELECT username,role,must_change FROM users").fetchall(), [("root.ops", "admin", 0)])
+        empty = self.fresh_backend()
+        process = subprocess.Popen([sys.executable, "server.py"], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env={**clean_env(), **self.backend_env(empty), "PORT": "0", "DEV_MODE": "1", "ADMIN_USERNAME": "Root.Ops"})
+        try:
+            self.assertIn("listening on port", process.stdout.readline())
+        finally:
+            process.terminate()
+            _, stderr = process.communicate(timeout=5)
+        self.assertIn("generated password", stderr)
+        self.assertEqual(self.sql("SELECT username,role,must_change FROM users", backend=empty), [("root.ops", "admin", 0)])
 
-    @staticmethod
-    def count_users(directory):
-        with closing(sqlite3.connect(Path(directory) / "triage.db")) as db:
-            return db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    # --- storage backends ------------------------------------------------------------
+
+    def test_health_endpoint(self):
+        expected = {"ok": True, "db": "postgres" if PG_URL else "sqlite"}
+        status, data, headers = self.call("/api/health")  # no auth needed
+        self.assertEqual((status, data), (200, expected))
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        with urlopen(Request(self.base + "/api/health", method="HEAD"), timeout=10) as response:
+            self.assertEqual((response.status, response.read()), (200, b""))
+        self.assertEqual(self.call("/api/health", "POST", {})[0], 405)
+        if not PG_URL:
+            return
+        # Outage, as in a Patroni failover: the database disappears and its connections are cut.
+        name = urlsplit(self.backend_env()["DATABASE_URL"]).path[1:]
+        moved = name + "_away"
+        self.addCleanup(drop_pg_database, moved)
+        token = self.admin
+        with psycopg.connect(PG_URL, autocommit=True) as admin:
+            for _ in range(50):
+                admin.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=%s", (name,))
+                try:
+                    admin.execute(f"ALTER DATABASE {name} RENAME TO {moved}")
+                    break
+                except psycopg.errors.ObjectInUse:
+                    time.sleep(0.1)
+            status, data, _ = self.call("/api/health")
+            self.assertEqual((status, data), (503, {"ok": False, "db": "postgres"}))
+            status, data, headers = self.call("/api/me", token=token)
+            self.assertEqual(status, 503, data)
+            self.assertEqual(headers["Retry-After"], "5")
+            self.assertEqual(self.call(method="POST", data=self.ticket(), token=token)[0], 503)
+            admin.execute(f"ALTER DATABASE {moved} RENAME TO {name}")
+        # The same server process recovers on the next request: no restart, nothing half-written.
+        self.assertEqual(self.call("/api/health")[:2], (200, expected))
+        self.assertEqual(self.call("/api/me", token=token)[0], 200)
+        self.assertEqual(self.call(token=token)[1], [])
+
+    def test_concurrent_startup_on_one_database(self):
+        fresh = self.fresh_backend()
+        env = {**clean_env(), **self.backend_env(fresh), "PORT": "0", "ADMIN_PASSWORD": ADMIN_PASSWORD}
+        holder = None
+        if PG_URL:
+            # Hold the migration lock: neither instance may touch the schema until it is released.
+            holder = psycopg.connect(fresh["env"]["DATABASE_URL"], autocommit=True)
+            self.addCleanup(holder.close)
+            holder.execute("SELECT pg_advisory_lock(%s)", (server.MIGRATION_LOCK,))
+        processes = [self.spawn(env) for _ in range(2)]
+        for process in processes:
+            self.addCleanup(lambda p=process: (p.terminate(), p.wait(timeout=5), p.stdout.close()))
+        if holder:
+            ready, _, _ = select.select([p.stdout for p in processes], [], [], 2)
+            self.assertEqual(ready, [], "a server started while the migration lock was held")
+            self.assertTrue(all(p.poll() is None for p in processes))  # waiting, not crashed
+            self.assertEqual(self.count_users(fresh), 0)
+            holder.execute("SELECT pg_advisory_unlock(%s)", (server.MIGRATION_LOCK,))
+        bases = []
+        for process in processes:
+            line = process.stdout.readline()
+            self.assertIn("listening on port", line)
+            bases.append("http://127.0.0.1:" + line.split()[-1])
+        # Exactly one admin was bootstrapped, and both instances serve the same data.
+        self.assertEqual(self.sql("SELECT username FROM users", backend=fresh), [("admin",)])
+        self.base = bases[0]
+        token = self.login("admin", ADMIN_PASSWORD)
+        ticket = self.call(method="POST", data=self.ticket(), token=token)[1]
+        self.base = bases[1]
+        self.assertEqual(self.call(f"/api/tickets/{ticket['id']}", token=token)[1]["title"], ticket["title"])
+        self.assertLessEqual({"color", "is_bot"}, self.columns("users", backend=fresh))
+
+    def test_case_insensitive_usernames(self):
+        user = self.create_user("Sam.Ops", "temp-password-1")
+        self.assertEqual(user["username"], "sam.ops")  # stored lowercase
+        for name in ("SAM.OPS", "sam.ops", "Sam.ops"):
+            self.assertEqual(self.call("/api/users", "POST", {"username": name, "display_name": "Dup", "role": "user",
+                                                              "password": "long-enough-1"}, self.admin)[0], 409, name)
+        self.login("SAM.Ops", "temp-password-1")
+        # A mixed-case row written directly (e.g. by an older version or an import) is still unique
+        # case-insensitively and can sign in with any casing.
+        stamp = "2026-11-11T00:00:00.000Z"
+        insert = "INSERT INTO users(username,display_name,role,password_hash,must_change,created,updated) VALUES(?,?,'user',?,0,?,?)"
+        self.sql(insert, ("Mixed", "Mixed", server.hash_password("mixed-password-1"), stamp, stamp))
+        with self.assertRaises(DB_ERRORS):
+            self.sql(insert, ("MIXED", "Other", "x", stamp, stamp))
+        self.assertEqual(self.call("/api/users", "POST", {"username": "mixed", "display_name": "Dup", "role": "user",
+                                                          "password": "long-enough-1"}, self.admin)[0], 409)
+        self.assertEqual(self.call("/api/me", token=self.login("mIxEd", "mixed-password-1"))[1]["username"], "Mixed")
+        self.assertIn("already exists", self.admin_cli("create-user", "--username", "MIXED").stdout)
+        self.assertEqual(self.admin_cli("create-token", "--username", "mixed", "--name", "t").returncode, 0)
+        if PG_URL:
+            indexes = [r[0] for r in self.sql("SELECT indexdef FROM pg_indexes WHERE tablename='users'")]
+            self.assertTrue(any("UNIQUE" in d and "lower(username)" in d for d in indexes), indexes)
+
+    def test_import_sqlite(self):
+        if not PG_URL:
+            result = self.admin_cli("import-sqlite", "--from", str(Path(self.directory.name) / "triage.db"))
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("set DATABASE_URL", result.stderr)
+            return
+        target_with_admin = self.backend
+        # Build a real SQLite database with a SQLite-mode server: people, a bot with a token, tickets,
+        # assignments, comments and activity lines.
+        self.stop()
+        sqlite_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(sqlite_dir.cleanup)
+        self.backend = {"directory": sqlite_dir, "env": {"DATA_DIR": sqlite_dir.name}}
+        self.start()
+        self.assertEqual(self.call("/api/health")[1]["db"], "sqlite")
+        admin = self.login("admin", ADMIN_PASSWORD)
+        self.admin = admin
+        sam_user, sam = self.activate("sam", display_name="Sam Carter")
+        self.call("/api/me", "PATCH", {"color": "#112233"}, sam)
+        bot = self.create_bot()
+        bot_token = self.mint(bot["id"], "a0-nix")["token"]
+        self.call("/api/me", token=bot_token)  # sets last_used
+        first = self.call(method="POST", data={**self.ticket(), "assignee_id": bot["id"]}, token=sam)[1]
+        self.call(f"/api/tickets/{first['id']}/comments", "POST", {"body": "Looking"}, bot_token)
+        second = self.call(method="POST", data=self.ticket("Change"), token=bot_token)[1]
+        self.call(f"/api/tickets/{second['id']}", "PATCH", {"status": "Resolved", "assignee_id": sam_user["id"]}, admin)
+        snapshot = lambda: {"tickets": self.call(token=admin)[1],
+                            "details": [self.call(f"/api/tickets/{t}", token=admin)[1] for t in (first["id"], second["id"])],
+                            "users": self.call("/api/users", token=admin)[1],
+                            "assignable": self.call("/api/users/assignable", token=admin)[1],
+                            "tokens": self.call(f"/api/users/{bot['id']}/tokens", token=admin)[1]}
+        before = snapshot()
+        source = Path(sqlite_dir.name) / "triage.db"
+        # Import while the SQLite server is still running, as with podman exec.
+        fresh = self.fresh_backend()
+        result = self.admin_cli("import-sqlite", "--from", str(source), backend=fresh)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("users 3, api_tokens 1, sessions 2, tickets 2, comments 3", result.stdout)
+        self.assertNotIn("postgres@", result.stdout)
+        self.stop()
+        # The same API answers, the same sessions and tokens work.
+        self.backend = fresh
+        self.start(ADMIN_PASSWORD="")
+        self.assertEqual(self.call("/api/health")[1]["db"], "postgres")
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(self.call("/api/me", token=sam)[1]["color"], "#112233")
+        self.assertEqual(self.call("/api/me", token=bot_token)[1]["username"], "claude")
+        self.login("admin", ADMIN_PASSWORD)
+        # Sequences continue after the imported ids.
+        third = self.call(method="POST", data=self.ticket(), token=sam)[1]
+        self.assertEqual(third["id"], second["id"] + 1)
+        self.assertEqual(self.create_user("alex")["id"], max(u["id"] for u in before["users"]) + 1)
+        self.assertEqual(self.call(f"/api/tickets/{first['id']}/comments", "POST", {"body": "More"}, sam)[0], 201)
+        self.assertEqual(self.mint(bot["id"], "second")["id"], before["tokens"][0]["id"] + 1)
+        # A target that already has data is refused, unless --force (which replaces it).
+        refused = self.admin_cli("import-sqlite", "--from", str(source), backend=target_with_admin)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("already has 1 users and 0 tickets", refused.stderr)
+        self.assertIn("--force", refused.stderr)
+        forced = self.admin_cli("import-sqlite", "--from", str(source), "--force", backend=target_with_admin)
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM tickets", backend=target_with_admin), [(2,)])
+        missing = self.admin_cli("import-sqlite", "--from", str(Path(sqlite_dir.name) / "nope.db"), backend=self.fresh_backend())
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("no SQLite database", missing.stderr)
+
+    def test_import_old_schema_sqlite(self):
+        if not PG_URL:
+            self.skipTest("import-sqlite needs TEST_DATABASE_URL (PostgreSQL)")
+        legacy = tempfile.TemporaryDirectory()
+        self.addCleanup(legacy.cleanup)
+        source = Path(legacy.name) / "triage.db"
+        with closing(sqlite3.connect(source)) as db, db:
+            db.executescript(OLD_SCHEMA)
+            db.execute("INSERT INTO tickets(id,title,description,type,priority,service,requester,status,created,updated) VALUES(42,'Legacy','Keep me','Change','Low','Storage','Alex','Waiting','2026-11-07T12:00:00.000Z','2026-11-07T12:00:00.000Z')")
+            db.execute("INSERT INTO comments(ticket_id,author,body,created) VALUES(42,'Alex','Existing update','2026-11-07T12:00:00.000Z')")
+        self.stop()
+        self.backend = self.fresh_backend()
+        result = self.admin_cli("import-sqlite", "--from", str(source))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("users 0, api_tokens 0, sessions 0, tickets 1, comments 1", result.stdout)
+        # The source file is only read: no columns were added to it.
+        with closing(sqlite3.connect(source)) as db:
+            self.assertNotIn("assignee_id", {row[1] for row in db.execute("PRAGMA table_info(tickets)")})
+        self.start()  # no accounts were imported, so ADMIN_PASSWORD creates the first admin
+        token = self.login("admin", ADMIN_PASSWORD)
+        ticket = self.call("/api/tickets/42", token=token)[1]
+        self.assertEqual((ticket["title"], ticket["requester"], ticket["requester_id"], ticket["status"]), ("Legacy", "Alex", None, "Waiting"))
+        self.assertEqual([(c["author"], c["body"], c["kind"]) for c in ticket["comments"]], [("Alex", "Existing update", "comment")])
+        self.assertEqual(self.call(method="POST", data=self.ticket(), token=token)[1]["id"], 43)
+
+    def count_users(self, backend):
+        try:
+            return self.sql("SELECT COUNT(*) FROM users", backend=backend)[0][0]
+        except DB_ERRORS:  # no schema at all
+            return 0
 
 
 if __name__ == "__main__":

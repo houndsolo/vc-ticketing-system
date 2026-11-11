@@ -9,6 +9,8 @@ services:
       # Only needed for the first start (empty database); ignored afterwards.
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       TRUST_PROXY: ${TRUST_PROXY:-}
+      # Empty: SQLite in the triage-data volume. Set to use PostgreSQL instead (see README).
+      DATABASE_URL: ${DATABASE_URL:-}
     volumes:
       - triage-data:/app/data
 volumes:
