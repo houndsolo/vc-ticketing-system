@@ -27,6 +27,11 @@ SESSION_TTL = 14 * 24 * 3600  # sliding: every authenticated request extends it
 SESSION_REFRESH = 300  # write the new expiry at most this often per session
 PASSWORD_MIN, PASSWORD_MAX = 8, 256
 USERNAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{1,31}")
+COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
+# Default avatar colors (Sailor Mars tokens plus a few distinct hues), all bright
+# enough to read on the dark theme. Keep in sync with PALETTE in public/app.js.
+PALETTE = ("#f70997", "#21e2d7", "#b65bea", "#00f5b4", "#ffd27a",
+           "#ff6188", "#ff8fd0", "#5b9dff", "#ff9f43", "#a3e635")
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -68,17 +73,21 @@ MIGRATIONS = (
     ("tickets", "assignee_id", "INTEGER REFERENCES users(id)"),
     # 'comment' for posted updates, 'system' for activity lines such as assignment changes.
     ("comments", "kind", "TEXT NOT NULL DEFAULT 'comment'"),
+    # Per-user avatar color ('#rrggbb'); NULL means the default derived from the username.
+    ("users", "color", "TEXT"),
 )
 POST_MIGRATION = "CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee_id);"
 TICKET_COLUMNS = ("t.id,t.title,t.description,t.type,t.priority,t.service,"
                   "COALESCE(u.display_name,t.requester) AS requester,t.requester_id,"
                   "t.status,t.created,t.updated,t.assignee_id,"
                   "a.username AS assignee_username,a.display_name AS assignee_display_name,"
-                  "a.disabled AS assignee_disabled")
+                  "a.disabled AS assignee_disabled,a.color AS assignee_color,"
+                  "u.username AS requester_username,u.color AS requester_custom_color")
 TICKET_QUERY = (f"SELECT {TICKET_COLUMNS} FROM tickets t LEFT JOIN users u ON u.id=t.requester_id "
                 "LEFT JOIN users a ON a.id=t.assignee_id")
 COMMENT_QUERY = ("SELECT c.id,c.ticket_id,COALESCE(u.display_name,c.author) AS author,c.author_id,"
-                 "c.body,c.created,c.kind FROM comments c LEFT JOIN users u ON u.id=c.author_id")
+                 "c.body,c.created,c.kind,u.username AS author_username,u.color AS author_custom_color "
+                 "FROM comments c LEFT JOIN users u ON u.id=c.author_id")
 
 
 def now():
@@ -125,19 +134,48 @@ def token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def default_color(name):
+    """Deterministic palette color for a username (or a legacy stored name)."""
+    digest = hashlib.sha256(("dark-triage:" + str(name or "").strip().lower()).encode()).digest()
+    return PALETTE[int.from_bytes(digest[:4], "big") % len(PALETTE)]
+
+
+def effective_color(custom, name):
+    return custom or default_color(name)
+
+
+def parse_color(value):
+    """None (back to the default) or a '#rrggbb' string, normalized to lowercase."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not COLOR_RE.fullmatch(value):
+        raise RequestError(400, "color must be a hex color like #f70997, or null for the default.")
+    return value.lower()
+
+
 def public_user(row):
     return {"id": row["id"], "username": row["username"], "display_name": row["display_name"],
             "role": row["role"], "must_change": bool(row["must_change"]), "disabled": bool(row["disabled"]),
-            "created": row["created"], "last_login": row["last_login"]}
+            "created": row["created"], "last_login": row["last_login"],
+            "color": effective_color(row["color"], row["username"]), "custom_color": row["color"]}
 
 
 def ticket_json(row):
     ticket = {k: row[k] for k in ("id", "title", "description", "type", "priority", "service", "requester",
                                   "requester_id", "status", "created", "updated")}
+    # Legacy tickets without an account fall back to the stored requester name.
+    ticket["requester_color"] = effective_color(row["requester_custom_color"], row["requester_username"] or row["requester"])
     ticket["assignee"] = None if row["assignee_id"] is None or row["assignee_username"] is None else {
         "id": row["assignee_id"], "username": row["assignee_username"],
-        "display_name": row["assignee_display_name"], "disabled": bool(row["assignee_disabled"])}
+        "display_name": row["assignee_display_name"], "disabled": bool(row["assignee_disabled"]),
+        "color": effective_color(row["assignee_color"], row["assignee_username"])}
     return ticket
+
+
+def comment_json(row):
+    comment = {k: row[k] for k in ("id", "ticket_id", "author", "author_id", "body", "created", "kind")}
+    comment["author_color"] = effective_color(row["author_custom_color"], row["author_username"] or row["author"])
+    return comment
 
 
 def assignable_user(db, value):
@@ -357,6 +395,14 @@ class Handler(BaseHTTPRequestHandler):
         db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (user["id"], self.token_hash))
         return 200, {"user": public_user(db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone())}
 
+    def update_me(self, db, user):
+        """Self-service profile changes. Only the avatar color for now."""
+        x = self.body()
+        if "color" not in x:
+            raise RequestError(400, "Nothing to update: send color.")
+        db.execute("UPDATE users SET color=?,updated=? WHERE id=?", (parse_color(x["color"]), now(), user["id"]))
+        return 200, public_user(db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone())
+
     # --- user management (admins only) ------------------------------------
 
     def other_active_admins(self, db, user_id):
@@ -417,6 +463,7 @@ class Handler(BaseHTTPRequestHandler):
         display_name = x.get("display_name", target["display_name"])
         role = x.get("role", target["role"])
         disabled = x.get("disabled", bool(target["disabled"]))
+        color = parse_color(x["color"]) if "color" in x else target["color"]
         if not valid(display_name, 80):
             raise RequestError(400, "Enter a display name (up to 80 characters).")
         if role not in ROLES:
@@ -429,8 +476,8 @@ class Handler(BaseHTTPRequestHandler):
         stays_active_admin = role == "admin" and not disabled
         if was_active_admin and not stays_active_admin and self.other_active_admins(db, user_id) == 0:
             raise RequestError(409, "Keep at least one active admin.")
-        db.execute("UPDATE users SET display_name=?,role=?,disabled=?,updated=? WHERE id=?",
-                   (display_name.strip(), role, int(disabled), now(), user_id))
+        db.execute("UPDATE users SET display_name=?,role=?,disabled=?,color=?,updated=? WHERE id=?",
+                   (display_name.strip(), role, int(disabled), color, now(), user_id))
         if disabled:
             db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         return 200, public_user(db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
@@ -444,9 +491,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.login(db)
         user = self.authenticate(db)
         if path == "/api/me":
-            if self.command != "GET":
-                raise RequestError(405, "Method not allowed")
-            return 200, public_user(user)
+            if self.command == "GET":
+                return 200, public_user(user)
+            if self.command == "PATCH":
+                return self.update_me(db, user)
+            raise RequestError(405, "Method not allowed")
         if path == "/api/logout":
             if self.command != "POST":
                 raise RequestError(405, "Method not allowed")
@@ -461,8 +510,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/users/assignable":
             if self.command != "GET":
                 raise RequestError(405, "Method not allowed")
-            rows = db.execute("SELECT id,username,display_name FROM users WHERE disabled=0 ORDER BY display_name COLLATE NOCASE, username")
-            return 200, [dict(r) for r in rows]
+            rows = db.execute("SELECT id,username,display_name,color FROM users WHERE disabled=0 ORDER BY display_name COLLATE NOCASE, username")
+            return 200, [{"id": r["id"], "username": r["username"], "display_name": r["display_name"],
+                          "color": effective_color(r["color"], r["username"])} for r in rows]
         if path == "/api/users" or path.startswith("/api/users/"):
             return self.users_api(db, path, user)
         return self.tickets_api(db, path, user)
@@ -539,7 +589,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def ticket_detail(self, db, ticket_id):
         ticket = ticket_json(db.execute(TICKET_QUERY + " WHERE t.id=?", (ticket_id,)).fetchone())
-        ticket["comments"] = [dict(c) for c in db.execute(COMMENT_QUERY + " WHERE c.ticket_id=? ORDER BY c.id", (ticket_id,))]
+        ticket["comments"] = [comment_json(c) for c in db.execute(COMMENT_QUERY + " WHERE c.ticket_id=? ORDER BY c.id", (ticket_id,))]
         return ticket
 
     do_GET = handle_request

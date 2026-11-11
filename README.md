@@ -31,7 +31,8 @@ Everyone signs in with their own username and password. There is no self sign-up
 | | user | admin |
 |---|---|---|
 | See all tickets, create tickets, comment, change status, priority and assignee | ✓ | ✓ |
-| Create accounts, reset passwords, change roles, disable or enable accounts | | ✓ |
+| Change your own password and avatar color | ✓ | ✓ |
+| Create accounts, reset passwords, change roles and anyone's avatar color, disable or enable accounts | | ✓ |
 
 - **New accounts** get a username (2–32 characters: letters, digits, `.`, `-`, `_`; case-insensitive), a display name, a role, and a **temporary password**. At first sign-in the user must choose their own password before they can do anything else.
 - **Reset password** (admin) sets a new temporary password, signs the user out everywhere, and forces another change at next sign-in.
@@ -41,6 +42,16 @@ Everyone signs in with their own username and password. There is no self sign-up
 - Tickets and comments record the author's account. Names are shown from the account's current display name, so they can't be spoofed. Tickets and comments from the shared-password version keep the name that was typed in.
 
 Passwords are hashed with scrypt (random salt per password) and must be 8–256 characters. Sign-in returns a random session token. The browser keeps it in local storage and sends it as `Authorization: Bearer <token>`. The server stores only a SHA-256 hash of the token. Sessions slide: each one lasts 14 days after its last use. **Log out** ends the current session. After 5 failed sign-ins for one username, or 20 from one IP address within 15 minutes, further attempts are delayed with exponential backoff (up to 15 minutes). The counters are in memory and reset on restart.
+
+## Avatar colors
+
+Every person's avatar circle has its own color: in list rows, kanban cards, the ticket view (requester, assignee, updates and activity lines), the sidebar profile and the Users page.
+
+- **Default:** with no color chosen, the server picks one from a fixed palette of ten colors that read well on the dark theme (hot pink, cyan, violet, mint, gold, rose, light pink, blue, orange and lime). The pick is a hash of the username, so it is stable across restarts and devices. Tickets and comments from the shared-password version use the hash of their stored name.
+- **Readable initials:** the circle is filled with the color, and the initials are dark or white, whichever contrasts more (WCAG luminance). Custom dark colors stay readable.
+- **Your own color** (everyone): click **Color** under your name in the sidebar. Pick a palette swatch, or **Custom** for any color from the native picker. It saves immediately. **Use default** goes back to the hashed color.
+- **Anyone's color** (admin): on the **Users** page, click a person's color circle to pick a new one. **Reset** returns it to the default.
+- Colors are stored as `#rrggbb` in the nullable `users.color` column. `NULL` means the default.
 
 ## Configuration
 
@@ -65,7 +76,7 @@ Start again with `ADMIN_PASSWORD` set and a fresh admin is created. Re-create th
 
 ## Upgrading from the shared-password version
 
-The database file, ticket IDs, Docker volume, and container user ID (1000) are unchanged. The schema is migrated in place on startup: new `users` and `sessions` tables are added, plus nullable `tickets.requester_id`, `tickets.assignee_id` and `comments.author_id` columns and a `comments.kind` column (default `comment`). No rows are rewritten. Databases from the first accounts release get the assignment columns the same way. Back up the data directory first anyway.
+The database file, ticket IDs, Docker volume, and container user ID (1000) are unchanged. The schema is migrated in place on startup: new `users` and `sessions` tables are added, plus nullable `tickets.requester_id`, `tickets.assignee_id` and `comments.author_id` columns, a `comments.kind` column (default `comment`) and a nullable `users.color` column. No rows are rewritten. Databases from earlier accounts releases get the assignment and color columns the same way. Back up the data directory first anyway.
 
 1. Stop the old app.
 2. In `.env` (or your environment), replace `ACCESS_PASSWORD=…` with `ADMIN_PASSWORD=…` and optionally `ADMIN_USERNAME=…`. If `ACCESS_PASSWORD` is still set, it is **ignored** and a deprecation warning is logged.
@@ -81,16 +92,19 @@ API changes: the `requester` field on `POST /api/tickets` and the `author` field
 | `POST /api/login` `{username,password}` | anyone | → `{token, expires_in, user}`; 401 bad credentials, 403 disabled, 429 throttled (`Retry-After`) |
 | `POST /api/logout` | signed in | Revokes the current token |
 | `GET /api/me` | signed in | Current user (`must_change` is true while on a temporary password) |
+| `PATCH /api/me` `{color}` | signed in | Set your avatar color: `"#rrggbb"`, or `null` for the default. 400 for anything else → updated user |
 | `POST /api/me/password` `{current_password,new_password}` | signed in | Clears `must_change`, signs out other sessions |
 | `GET /api/tickets?assignee=<id>\|me\|none` | signed in | All tickets, newest activity first; `assignee` is an optional filter (400 if it's anything else) |
 | `POST /api/tickets` `{title,description,service,priority,type,assignee_id?}` | signed in | → 201 ticket. You are the requester. `assignee_id` is a user id or `null` |
 | `GET /api/tickets/:id` | signed in | Ticket plus `comments` (each with `kind`: `comment` or `system`) |
 | `PATCH /api/tickets/:id` `{status?,priority?,assignee_id?}` | signed in | Partial update; send at least one field. → updated ticket with comments |
 | `POST /api/tickets/:id/comments` `{body}` | signed in | Posts an update as you |
-| `GET /api/users/assignable` | signed in | `[{id, username, display_name}]` of active accounts, for the assignee picker |
-| `GET/POST /api/users`, `GET/PATCH /api/users/:id` `{display_name?,role?,disabled?}`, `POST /api/users/:id/password` `{password}` | admin | 403 for users, 409 for duplicate username or last-admin protection |
+| `GET /api/users/assignable` | signed in | `[{id, username, display_name, color}]` of active accounts, for the assignee picker |
+| `GET/POST /api/users`, `GET/PATCH /api/users/:id` `{display_name?,role?,disabled?,color?}`, `POST /api/users/:id/password` `{password}` | admin | 403 for users, 409 for duplicate username or last-admin protection |
 
-Every ticket object has `assignee`: either `null` or `{id, username, display_name, disabled}`.
+Every ticket object has `requester_color` and `assignee`: either `null` or `{id, username, display_name, disabled, color}`. Every comment, including activity lines, has `author_color`. User objects (`/api/me`, `/api/users`, login) have `color` (the effective color, always `#rrggbb`) and `custom_color` (the stored choice, or `null` when using the default).
+
+A color must match `^#[0-9a-fA-F]{6}$`. It is stored in lowercase. Anything else (names like `red`, 3-digit hex, missing `#`, numbers) gets a 400. Non-admins get 403 from `PATCH /api/users/:id`, including for their own id: they use `PATCH /api/me`.
 
 While `must_change` is true, everything except `/api/me`, `/api/me/password` and `/api/logout` returns 403 with `"code": "password_change_required"`. Cross-origin writes are rejected: a request whose `Origin` doesn't match its `Host` gets 403.
 
@@ -130,4 +144,4 @@ SQLite uses WAL mode and parameterized queries. Back up the entire data director
 python3 -m unittest discover -s test -v
 ```
 
-The integration tests start the real server. They cover admin bootstrap, login and logout, wrong passwords and throttling, forced password change for temporary passwords, admin create, reset, role change, disable and enable, non-admins being refused user management, last-admin protection, session revocation, shared ticket rights (status, priority, comments), assignment (on create, reassign, unassign, the `me`/`none`/id filters, disabled and nonexistent assignees, the assignable-user list vs. admin-only `/api/users`, activity lines), validation, cross-origin rejection, persistence across restarts, and migration of an old-schema database (including the new assignment columns). Browser visual QA and Docker execution are not included.
+The integration tests start the real server. They cover admin bootstrap, login and logout, wrong passwords and throttling, forced password change for temporary passwords, admin create, reset, role change, disable and enable, non-admins being refused user management, last-admin protection, session revocation, shared ticket rights (status, priority, comments), assignment (on create, reassign, unassign, the `me`/`none`/id filters, disabled and nonexistent assignees, the assignable-user list vs. admin-only `/api/users`, activity lines), validation, cross-origin rejection, persistence across restarts, avatar colors (deterministic valid defaults, set and reset your own, strict validation, admin-only changes to others, colors in tickets, comments, activity lines and the assignable list), and migration of an old-schema database and of an accounts database without `users.color`. Browser visual QA and Docker execution are not included.

@@ -2,6 +2,7 @@ from contextlib import closing
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -308,7 +309,8 @@ class ApiTests(unittest.TestCase):
         alex_user, alex = self.activate("alex", display_name="Alex Doe")
         status, ticket, _ = self.call(method="POST", data={**self.ticket(), "assignee_id": alex_user["id"]}, token=sam)
         self.assertEqual(status, 201, ticket)
-        self.assertEqual(ticket["assignee"], {"id": alex_user["id"], "username": "alex", "display_name": "Alex Doe", "disabled": False})
+        self.assertEqual(ticket["assignee"], {"id": alex_user["id"], "username": "alex", "display_name": "Alex Doe", "disabled": False,
+                                              "color": alex_user["color"]})
         unassigned = self.call(method="POST", data=self.ticket(), token=sam)[1]
         self.assertIsNone(unassigned["assignee"])
         self.assertIsNone(self.call(method="POST", data={**self.ticket(), "assignee_id": None}, token=sam)[1]["assignee"])
@@ -382,13 +384,98 @@ class ApiTests(unittest.TestCase):
         status, people, _ = self.call("/api/users/assignable", token=sam)
         self.assertEqual(status, 200)
         self.assertEqual([p["username"] for p in people], ["admin", "sam"])
-        self.assertEqual(set(people[0]), {"id", "username", "display_name"})
+        self.assertEqual(set(people[0]), {"id", "username", "display_name", "color"})
         self.assertEqual(self.call("/api/users", token=sam)[0], 403)
         self.assertEqual(self.call("/api/users/assignable", token=None)[0], 401)
         self.assertEqual(self.call("/api/users/assignable", "POST", {}, sam)[0], 405)
         # Admin user management is unaffected by the new route.
         self.assertEqual(self.call("/api/users/assignable", token=self.admin)[0], 200)
         self.assertEqual(self.call(f"/api/users/{alex_user['id']}", token=self.admin)[1]["username"], "alex")
+
+    # --- avatar colors -----------------------------------------------------------
+
+    def test_default_color_is_deterministic_and_valid(self):
+        sys.path.insert(0, str(ROOT))
+        try:
+            import server
+        finally:
+            sys.path.remove(str(ROOT))
+        me = self.call("/api/me", token=self.admin)[1]
+        self.assertIsNone(me["custom_color"])
+        self.assertRegex(me["color"], r"^#[0-9a-f]{6}$")
+        self.assertIn(me["color"], server.PALETTE)
+        self.assertEqual(me["color"], server.default_color("admin"))
+        self.assertEqual(server.default_color("Admin"), server.default_color("admin"))
+        # The owner's example: admin and Haystack get different circles out of the box.
+        self.assertNotEqual(server.default_color("admin"), server.default_color("haystack"))
+        user = self.create_user("haystack", display_name="Haystack")
+        self.assertEqual(user["color"], server.default_color("haystack"))
+        # Stable across requests and restarts.
+        self.restart()
+        self.assertEqual(self.call("/api/me", token=self.admin)[1]["color"], me["color"])
+        self.assertTrue(all(re.fullmatch(r"#[0-9a-f]{6}", c) for c in server.PALETTE))
+        self.assertGreaterEqual(len(set(server.PALETTE)), 8)
+
+    def test_set_and_reset_own_color(self):
+        user, token = self.activate("sam")
+        default = user["color"]
+        status, me, _ = self.call("/api/me", "PATCH", {"color": "#A1B2C3"}, token)
+        self.assertEqual(status, 200, me)
+        self.assertEqual((me["color"], me["custom_color"]), ("#a1b2c3", "#a1b2c3"))
+        self.assertEqual(self.call("/api/me", token=token)[1]["color"], "#a1b2c3")
+        status, me, _ = self.call("/api/me", "PATCH", {"color": None}, token)
+        self.assertEqual(status, 200)
+        self.assertEqual((me["color"], me["custom_color"]), (default, None))
+        for bad in ({}, {"color": "red"}, {"color": "#abc"}, {"color": "#abcdeg"}, {"color": "a1b2c3"},
+                    {"color": "#a1b2c3 "}, {"color": "#a1b2c3\n"}, {"color": 123456}, {"color": ["#a1b2c3"]}, {"color": True}):
+            self.assertEqual(self.call("/api/me", "PATCH", bad, token)[0], 400, bad)
+        self.assertIsNone(self.call("/api/me", token=token)[1]["custom_color"])
+        self.assertEqual(self.call("/api/me", "PUT", {"color": "#000000"}, token)[0], 405)
+        self.assertEqual(self.call("/api/me", "PATCH", {"color": "#000000"})[0], 401)
+
+    def test_color_permissions(self):
+        sam_user, sam = self.activate("sam")
+        alex_user, alex = self.activate("alex")
+        admin_id = self.call("/api/me", token=self.admin)[1]["id"]
+        # Users can't change anyone else's color, the admin's included.
+        for target in (alex_user["id"], admin_id, sam_user["id"]):
+            self.assertEqual(self.call(f"/api/users/{target}", "PATCH", {"color": "#123456"}, sam)[0], 403)
+        self.assertIsNone(self.call("/api/me", token=alex)[1]["custom_color"])
+        # Admins can set and clear anyone's color; other fields are untouched.
+        status, changed, _ = self.call(f"/api/users/{alex_user['id']}", "PATCH", {"color": "#00FF00"}, self.admin)
+        self.assertEqual(status, 200, changed)
+        self.assertEqual((changed["color"], changed["role"], changed["display_name"]), ("#00ff00", "user", "Alex"))
+        self.assertEqual(self.call("/api/me", token=alex)[1]["color"], "#00ff00")
+        # A later PATCH without color keeps it.
+        self.assertEqual(self.call(f"/api/users/{alex_user['id']}", "PATCH", {"display_name": "Alex D"}, self.admin)[1]["color"], "#00ff00")
+        self.assertEqual(self.call(f"/api/users/{alex_user['id']}", "PATCH", {"color": "green"}, self.admin)[0], 400)
+        self.assertEqual(self.call(f"/api/users/{alex_user['id']}", "PATCH", {"color": None}, self.admin)[1]["color"], alex_user["color"])
+        users = {u["username"]: u for u in self.call("/api/users", token=self.admin)[1]}
+        self.assertEqual(users["alex"]["custom_color"], None)
+        # A user can still set their own color through /api/me.
+        self.assertEqual(self.call("/api/me", "PATCH", {"color": "#fedcba"}, sam)[1]["color"], "#fedcba")
+
+    def test_colors_in_tickets_comments_and_assignable(self):
+        sam_user, sam = self.activate("sam", display_name="Sam Carter")
+        alex_user, alex = self.activate("alex", display_name="Alex Doe")
+        self.call("/api/me", "PATCH", {"color": "#112233"}, sam)
+        ticket = self.call(method="POST", data={**self.ticket(), "assignee_id": alex_user["id"]}, token=sam)[1]
+        self.assertEqual(ticket["requester_color"], "#112233")
+        self.assertEqual(ticket["assignee"]["color"], alex_user["color"])
+        path = f"/api/tickets/{ticket['id']}"
+        self.call(path + "/comments", "POST", {"body": "On it"}, alex)
+        detail = self.call(path, token=sam)[1]
+        self.assertEqual([(c["kind"], c["author_color"]) for c in detail["comments"]],
+                         [("system", "#112233"), ("comment", alex_user["color"])])
+        # Changing a color is reflected everywhere at once.
+        self.call(f"/api/users/{alex_user['id']}", "PATCH", {"color": "#445566"}, self.admin)
+        listed = self.call(token=sam)[1][0]
+        self.assertEqual((listed["requester_color"], listed["assignee"]["color"]), ("#112233", "#445566"))
+        self.assertEqual(self.call(path, token=sam)[1]["comments"][1]["author_color"], "#445566")
+        people = {p["username"]: p["color"] for p in self.call("/api/users/assignable", token=sam)[1]}
+        self.assertEqual(people["alex"], "#445566")
+        self.assertEqual(people["sam"], "#112233")
+        self.assertRegex(people["admin"], r"^#[0-9a-f]{6}$")
 
     # --- startup and migration -------------------------------------------------
 
@@ -410,9 +497,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual((ticket["comments"][0]["author"], ticket["comments"][0]["body"]), ("Alex", "Existing update"))
         self.assertIsNone(ticket["assignee"])
         self.assertEqual(ticket["comments"][0]["kind"], "comment")
+        # Legacy rows without an account get the default color of their stored name.
+        self.assertRegex(ticket["requester_color"], r"^#[0-9a-f]{6}$")
+        self.assertEqual(ticket["requester_color"], ticket["comments"][0]["author_color"])  # both "Alex"
         with closing(sqlite3.connect(Path(directory.name) / "triage.db")) as db:
             self.assertIn("assignee_id", {row[1] for row in db.execute("PRAGMA table_info(tickets)")})
             self.assertIn("kind", {row[1] for row in db.execute("PRAGMA table_info(comments)")})
+            self.assertIn("color", {row[1] for row in db.execute("PRAGMA table_info(users)")})
         admin_id = self.call("/api/me", token=token)[1]["id"]
         self.assertEqual(self.call("/api/tickets/42", "PATCH", {"assignee_id": admin_id}, token)[1]["assignee"]["id"], admin_id)
         self.assertEqual([t["id"] for t in self.call("/api/tickets?assignee=me", token=token)[1]], [42])
@@ -424,6 +515,22 @@ class ApiTests(unittest.TestCase):
         legacy = self.call("/api/tickets/42", token=token)[1]
         self.assertEqual(len(legacy["comments"]), 3)  # original, assignment activity, new update
         self.assertEqual(legacy["assignee"]["id"], admin_id)
+
+    def test_migrates_accounts_database_without_color(self):
+        user, token = self.activate("sam", display_name="Sam Carter")
+        ticket = self.call(method="POST", data=self.ticket(), token=token)[1]
+        self.stop()
+        with closing(sqlite3.connect(Path(self.directory.name) / "triage.db")) as db, db:
+            db.execute("ALTER TABLE users DROP COLUMN color")  # the schema before avatar colors
+        self.start()
+        with closing(sqlite3.connect(Path(self.directory.name) / "triage.db")) as db:
+            self.assertIn("color", {row[1] for row in db.execute("PRAGMA table_info(users)")})
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM users WHERE color IS NULL").fetchone()[0], 2)
+        # Sessions, accounts and tickets survive; everyone gets their default color.
+        me = self.call("/api/me", token=token)[1]
+        self.assertEqual((me["username"], me["color"], me["custom_color"]), ("sam", user["color"], None))
+        self.assertEqual(self.call(f"/api/tickets/{ticket['id']}", token=token)[1]["requester_color"], user["color"])
+        self.assertEqual(self.call("/api/me", "PATCH", {"color": "#abcdef"}, token)[1]["color"], "#abcdef")
 
     def test_admin_password_required_on_first_start(self):
         env = {k: v for k, v in os.environ.items() if k not in ("ACCESS_PASSWORD", "ADMIN_PASSWORD", "DEV_MODE")}

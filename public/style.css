@@ -48,3 +48,29 @@ nav .nav-label{margin-top:22px}
 .comment.activity strong{color:var(--text-2);font-weight:600}
 .activity-mark{color:var(--accent-2)}
 @media(max-width:760px){.filters{flex-wrap:wrap}}
+/* avatar colors: a per-user fill with dark or light initials (set from data-color in app.js) */
+.avatar[data-color]{background:var(--av);color:var(--av-ink);box-shadow:inset 0 0 0 1px rgba(229,243,226,.14)}
+.avatar.mini{width:18px;height:18px;font-size:8px;vertical-align:middle;margin:0 5px 0 2px}
+.requester-by .avatar.mini{margin-left:4px}
+.profile-actions{flex-wrap:wrap;row-gap:2px}
+.color-toggle{flex-basis:100%;text-align:left;display:flex;align-items:center;gap:7px}
+.color-dot{width:10px;height:10px;border-radius:50%;background:var(--av,var(--accent));box-shadow:0 0 0 1px rgba(229,243,226,.18)}
+.profile-area{position:relative}
+/* A popover above the profile, so the fixed sidebar never overflows. */
+.color-panel{position:absolute;left:0;right:0;bottom:calc(100% + 10px);z-index:5;border:1px solid var(--border-strong);border-radius:9px;padding:12px;background:var(--surface);box-shadow:0 12px 32px rgba(1,3,4,.7),0 0 18px rgba(153,50,204,.15)}
+.color-panel-head{font-size:13px;color:var(--text-2);margin-bottom:10px}
+.color-panel-head small{display:block;margin-top:3px;font:11px ui-monospace,monospace;color:var(--faint)}
+.swatches{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}
+.swatch{aspect-ratio:1;width:100%;border-radius:50%;border:2px solid transparent;background:var(--av,var(--raised));padding:0;box-shadow:inset 0 0 0 1px rgba(1,3,4,.35)}
+.swatch:hover{transform:scale(1.08)}
+.swatch.selected{border-color:var(--text);box-shadow:inset 0 0 0 2px var(--bg)}
+.color-custom{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;color:var(--muted)}
+.color-custom label{margin:0}
+.color-custom .link-button{margin-left:auto}
+.color-custom .link-button:disabled{opacity:.4;cursor:default}
+.color-input{width:30px;height:30px;padding:0;border:1px solid var(--border-strong);border-radius:50%;background:none;cursor:pointer;overflow:hidden}
+.color-input::-webkit-color-swatch-wrapper{padding:0}
+.color-input::-webkit-color-swatch{border:0;border-radius:50%}
+.color-input::-moz-color-swatch{border:0;border-radius:50%}
+.color-cell{display:flex;align-items:center;gap:8px}
+.color-cell small{font-size:12px}
