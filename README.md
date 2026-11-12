@@ -216,7 +216,12 @@ Create a ticket with a title, details, service, and priority. You are recorded a
   pick **Parent ticket** and Save; a ticket that already has children brings them along.
 - The **Group** panel lists the parent (★) and its children; **Make parent** on any child makes it the new parent
   (the old parent and the siblings become its children). Activity lines record every change.
-- The list and board show `▣ N` on a parent (group size) and `↳ DT-###` on a child. Deleting a parent ungroups its children.
+- The list and board show `▣ N · K open` on a parent (group size, children still open) and `↳ DT-###` on a child.
+  Deleting a parent ungroups its children.
+- Groups collapse: a parent's ▸ caret tucks its children under it (▾ shows them indented right below it);
+  **Expand/Collapse groups** toggles every group, and the state is remembered per browser. A child is only
+  tucked away when its parent is in the current list, so filters never hide open work; searching opens every
+  group; sorting sorts groups as units, by their parent.
 - API: `PATCH /api/tickets/:id {"parent_id": id|null}`, `POST /api/tickets/:id/make-parent`; tickets carry
   `parent`, `child_count` and (detail) `group`. dt: `dt update ID --parent DT-5|none`, `dt make-parent ID`.
 - The ticket view shows the controls (status, priority, assignee, parent) first, then the group, then the problem

@@ -181,3 +181,15 @@ th .sort.on .sort-ind{color:var(--accent);opacity:1}
 .ticket-bar-actions .danger{margin-right:6px}
 .save-hint{text-align:right;margin:10px 0 4px}
 @media(max-width:760px){.ticket-bar{flex-wrap:wrap;gap:10px}.ticket-bar-title h2{white-space:normal}.ticket-bar-actions{width:100%;justify-content:flex-end}}
+
+/* Collapsible groups */
+#toggle-groups{margin-left:auto;margin-right:10px}
+.caret{display:inline-flex;align-items:center;gap:3px;margin-right:8px;padding:1px 6px;border:1px solid rgba(33,226,215,.4);border-radius:5px;background:rgba(33,226,215,.08);color:var(--accent-2);font:600 11px ui-monospace,monospace;cursor:pointer;vertical-align:middle}
+.caret:hover{background:rgba(33,226,215,.18)}
+.caret span{font-size:10px}
+tbody tr.child-row{background:rgba(33,226,215,.03)}
+tbody tr.child-row td.id{padding-left:34px}
+tbody tr.child-row .tree{color:var(--accent-2);margin-right:6px}
+.board-card{cursor:pointer}
+.board-card.child-card{margin-left:14px;width:calc(100% - 14px);border-left:2px solid rgba(33,226,215,.45)}
+.board-card .caret{float:right;margin:0}
