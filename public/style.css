@@ -199,3 +199,24 @@ tbody tr.child-row .tree{color:#1fbfb0;margin-right:6px}
 time.when{white-space:nowrap;color:var(--faint);font-size:12px;cursor:help}
 .card-when{margin-top:8px;font-size:11px;color:var(--faint)}.card-when time.when{font-size:11px}
 .detail-when time.when{color:inherit}
+
+/* Folders layout: one collapsible folder per service (category), inside the list table */
+.section-heading h2{margin-right:auto}
+#toggle-groups{margin-left:0}
+#toggle-folders{margin-right:10px}
+tbody.folder tr.folder-row{cursor:default}
+tbody.folder tr.folder-row:hover{background:none}
+tr.folder-row td{padding:0;background:var(--surface-2);border-top:1px solid var(--border-strong);border-bottom:1px solid var(--border-strong)}
+tbody.folder:first-of-type tr.folder-row td{border-top:0}
+.folder-bar{display:flex;align-items:center;gap:12px;padding:10px 14px;border-left:3px solid var(--accent)}
+tbody.folder:not(.open) .folder-bar{border-left-color:var(--border-strong)}
+.folder-toggle{flex:1;min-width:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:none;border:0;padding:2px 0;color:var(--text);text-align:left;font-size:14px}
+.folder-toggle:hover strong{color:var(--accent)}
+.folder-caret{color:var(--accent-2);width:12px;font-size:12px}
+.folder-icon{color:var(--accent);font-size:13px;text-shadow:0 0 10px rgba(247,9,151,.45)}
+tbody.folder:not(.open) .folder-icon{color:var(--faint);text-shadow:none}
+.folder-count{font:11px ui-monospace,monospace;border:1px solid var(--border-strong);border-radius:5px;padding:1px 6px;color:var(--muted)}
+.folder-note{font-size:12px;color:var(--faint)}
+.folder-toggle .priority{font-size:12px}
+.folder-only{white-space:nowrap}
+#service-filter{max-width:220px}

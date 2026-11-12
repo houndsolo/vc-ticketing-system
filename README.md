@@ -2,7 +2,7 @@
 
 A little chaos. A lot more clarity.
 
-A self-hosted helpdesk for your homelab and friends, built with Python's standard library and SQLite. No Node.js, npm, pip packages, or build step. Optionally it stores its data in PostgreSQL instead (one pip package, see [Storage backends](#storage-backends)). The browser uses plain HTML, CSS, and JavaScript. A dark interface with hot-pink and cyan accents, responsive layouts, a list and kanban board, live search, priority and status filters, and keyboard shortcuts.
+A self-hosted helpdesk for your homelab and friends, built with Python's standard library and SQLite. No Node.js, npm, pip packages, or build step. Optionally it stores its data in PostgreSQL instead (one pip package, see [Storage backends](#storage-backends)). The browser uses plain HTML, CSS, and JavaScript. A dark interface with hot-pink and cyan accents, responsive layouts, a list, a kanban board and folders by service, live search, priority, service and status filters, and keyboard shortcuts.
 
 ## Run with Docker
 
@@ -237,6 +237,19 @@ Create a ticket with a title, details, service, and priority. You are recorded a
   `parent`, `child_count` and (detail) `group`. dt: `dt update ID --parent DT-5|none`, `dt make-parent ID`.
 - The ticket view shows the controls (status, priority, assignee, parent) first, then the group, then the problem
   description as the opening post, then the follow-up conversation.
+
+### Services as categories (folders)
+- A ticket's **Service** is its category; no parent needed. It's free text, matched case-insensitively
+  (`vms` = `VMs`) and shown in its most-used spelling.
+- The **All services** filter in the toolbar (each service with its open-ticket count) narrows the list, board and
+  folders alike, and combines with the status tabs, priority, assignee and search.
+- The queue has three layouts, switched at the top right and remembered per browser: **list** ☷, **board** ▥
+  (columns by status) and **folders** ❐. Folders put the list into one collapsible folder per service, A→Z; each
+  folder header shows its ticket count, how many are still open (when the status tab shows closed ones too), and
+  how many open tickets are High/Critical. **only this ↗** filters to that service. **Open/Close folders** toggles
+  every folder; open/closed state is remembered per browser, and searching opens every folder.
+- Ticket groups still work inside folders. A child whose parent has a different service stays a normal row in
+  its own folder.
 
 ## Assignment
 
