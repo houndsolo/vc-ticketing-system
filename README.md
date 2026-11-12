@@ -202,6 +202,14 @@ While `must_change` is true, everything except `/api/me`, `/api/me/password` and
 
 Create a ticket with a title, details, service, and priority. You are recorded as the requester. Open a ticket to move it through **Open → In progress → Waiting → Resolved**, adjust its priority, or post an update. Assign it to someone, or to yourself, so everyone knows who's on it. See [Assignment](#assignment) for the keyboard shortcuts. Resolved tickets remain searchable and can be reopened. The app starts empty, with no fabricated service health or demo tickets.
 
+
+### Statuses, closing and deleting
+- Statuses: **Open**, **In progress**, **Waiting**, **Resolved**, **Canceled**. Resolved and Canceled count as closed
+  (not active work; the sidebar's **Closed** view lists both; `dt list` hides them unless `--all`).
+- Saving in the ticket view closes it.
+- **Admins** can delete a ticket and its whole conversation (Delete button in the ticket view, with a confirmation;
+  `DELETE /api/tickets/:id`; `dt delete DT-007`). Other users and bots get 403. Deleting is permanent.
+
 ## Assignment
 
 Each ticket has at most one **assignee**: an account, or nobody. Everyone can set, change, or clear the assignee on any ticket. Assignment uses the same shared ticket rights as status and priority.

@@ -172,6 +172,31 @@ class ApiTests(unittest.TestCase):
         return {"title": "Test " + kind, "description": "Details <script>alert(1)</script>",
                 "service": "Network", "priority": "High", "type": kind}
 
+    # --- canceled status and deleting tickets -------------------------------
+
+    def test_canceled_status(self):
+        status, t, _ = self.call("/api/tickets", "POST", self.ticket(), self.admin)
+        self.assertEqual(status, 201, t)
+        status, d, _ = self.call(f"/api/tickets/{t['id']}", "PATCH", {"status": "Canceled"}, self.admin)
+        self.assertEqual((status, d["status"]), (200, "Canceled"), d)
+        self.assertEqual(self.call(f"/api/tickets/{t['id']}", "PATCH", {"status": "Cancelled"}, self.admin)[0], 400)
+
+    def test_admin_deletes_ticket_and_conversation(self):
+        _, user = self.activate("haystack")
+        status, t, _ = self.call("/api/tickets", "POST", self.ticket(), user)
+        self.assertEqual(status, 201, t)
+        self.assertEqual(self.call(f"/api/tickets/{t['id']}/comments", "POST", {"body": "hi"}, user)[0], 201)
+        status, data, _ = self.call(f"/api/tickets/{t['id']}", "DELETE", None, user)
+        self.assertEqual(status, 403, data)  # not an admin, not even for their own ticket
+        status, data, _ = self.call(f"/api/tickets/{t['id']}", "DELETE", None, self.admin)
+        self.assertEqual((status, data.get("deleted")), (200, t["id"]), data)
+        self.assertEqual(self.call(f"/api/tickets/{t['id']}", token=self.admin)[0], 404)
+        self.assertEqual(self.call(f"/api/tickets/{t['id']}", "DELETE", None, self.admin)[0], 404)
+        self.assertNotIn(t["id"], [x["id"] for x in self.call(token=self.admin)[1]])
+        # The next ticket still gets a fresh number (ids aren't reused after a delete of the newest).
+        status, t2, _ = self.call("/api/tickets", "POST", self.ticket(), self.admin)
+        self.assertEqual(status, 201, t2)
+
     # --- accounts ------------------------------------------------------------
 
     def test_bootstrap_admin_login_and_logout(self):

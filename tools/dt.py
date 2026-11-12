@@ -28,7 +28,7 @@ DEFAULT_TOKEN_FILE = "~/.config/dark-triage/token"
 # Mirrors server.py (TYPES, PRIORITIES, STATUSES).
 TYPES = ("Issue", "Request", "Change")
 PRIORITIES = ("Low", "Medium", "High", "Critical")
-STATUSES = ("Open", "In progress", "Waiting", "Resolved")
+STATUSES = ("Open", "In progress", "Waiting", "Resolved", "Canceled")
 # The web form suggests these services; any text of 1-80 characters is accepted.
 SERVICES = ("Jellyfin", "Plex", "Network", "Proxmox", "Storage", "Other")
 
@@ -233,7 +233,7 @@ def cmd_list(client, args):
     if args.status:
         tickets = [t for t in tickets if t["status"] in args.status]
     elif not args.all:
-        tickets = [t for t in tickets if t["status"] != "Resolved"]
+        tickets = [t for t in tickets if t["status"] not in ("Resolved", "Canceled")]
     if args.type:
         tickets = [t for t in tickets if t["type"] == args.type]
     if args.priority:
@@ -262,6 +262,17 @@ def cmd_comment(client, args):
     body = read_text(args.body, "comment")
     client.call(f"/tickets/{args.id}/comments", "POST", {"body": body})
     print(f"Posted an update on {label(args.id)} {client.url(args.id)}")
+
+
+def cmd_delete(client, args):
+    if not args.yes:
+        ticket = client.call(f"/tickets/{args.id}")
+        sys.stderr.write(f"Delete {label(args.id)} \"{ticket['title']}\" and its conversation permanently? [y/N] ")
+        sys.stderr.flush()
+        if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+            raise SystemExit("Not deleted.")
+    client.call(f"/tickets/{args.id}", "DELETE")
+    print(f"Deleted {label(args.id)}")
 
 
 def cmd_update(client, args):
@@ -318,7 +329,7 @@ exit codes: 0 ok, 1 request refused by the server, 2 usage/config error, 3 serve
     p.add_argument("--json", action="store_true", help="print the created ticket as JSON")
     p.set_defaults(func=cmd_new)
 
-    p = commands.add_parser("list", help="list tickets (unresolved by default)")
+    p = commands.add_parser("list", help="list tickets (open work by default: not Resolved or Canceled)")
     p.add_argument("--status", type=status, action="append", help="repeatable; overrides the unresolved default")
     p.add_argument("--all", action="store_true", help="include resolved tickets")
     p.add_argument("--assignee", metavar="me|none|USERNAME")
@@ -337,6 +348,11 @@ exit codes: 0 ok, 1 request refused by the server, 2 usage/config error, 3 serve
     p.add_argument("id", type=ticket_id, metavar="DT-###|ID")
     p.add_argument("--body", required=True, metavar="TEXT|-", help="update text (up to 5000 characters); - reads stdin")
     p.set_defaults(func=cmd_comment)
+
+    p = commands.add_parser("delete", help="delete a ticket and its conversation (admins only)")
+    p.add_argument("id", type=ticket_id, metavar="DT-###|ID")
+    p.add_argument("--yes", action="store_true", help="don't ask for confirmation")
+    p.set_defaults(func=cmd_delete)
 
     p = commands.add_parser("update", help="change status, priority or assignee")
     p.add_argument("id", type=ticket_id, metavar="DT-###|ID")

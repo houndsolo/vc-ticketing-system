@@ -21,7 +21,8 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parent
 TYPES = ("Issue", "Request", "Change")
 PRIORITIES = ("Low", "Medium", "High", "Critical")
-STATUSES = ("Open", "In progress", "Waiting", "Resolved")
+STATUSES = ("Open", "In progress", "Waiting", "Resolved", "Canceled")
+CLOSED_STATUSES = ("Resolved", "Canceled")  # done: not counted as open work
 ROLES = ("admin", "user")
 MAX_BODY = 24000
 SESSION_TTL = 14 * 24 * 3600  # sliding: every authenticated request extends it
@@ -859,6 +860,13 @@ class Handler(BaseHTTPRequestHandler):
                        (ticket_id, user["display_name"], user["id"], x["body"].strip(), timestamp))
             db.execute("UPDATE tickets SET updated=? WHERE id=?", (timestamp, ticket_id))
             return 201, {"ok": True}
+        if self.command == "DELETE" and not match[2]:
+            # Admins only. Permanent: the ticket and its whole conversation (activity lines included).
+            if user["role"] != "admin":
+                raise RequestError(403, "Only admins can delete tickets.")
+            db.execute("DELETE FROM comments WHERE ticket_id=?", (ticket_id,))
+            db.execute("DELETE FROM tickets WHERE id=?", (ticket_id,))
+            return 200, {"ok": True, "deleted": ticket_id}
         raise RequestError(405, "Method not allowed")
 
     def ticket_detail(self, db, ticket_id):
