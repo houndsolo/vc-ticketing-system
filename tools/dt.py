@@ -13,6 +13,7 @@ permissions), 2 usage or configuration error, 3 the server could not be reached.
 """
 
 import argparse
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -142,6 +143,21 @@ def name(person, fallback="unassigned"):
     return text + (" (disabled)" if person.get("disabled") else "")
 
 
+def stamp(iso, seconds=False):
+    """Server timestamps are UTC ISO 8601; show them in local time."""
+    try:
+        moment = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    except (AttributeError, ValueError):
+        return iso or "-"
+    return moment.strftime("%Y-%m-%d %H:%M:%S %Z" if seconds else "%Y-%m-%d %H:%M")
+
+
+# dt list --sort: key, and whether the default (no --reverse) order is newest/highest first.
+SORTS = {"updated": (lambda t: t["updated"], True), "created": (lambda t: t["created"], True),
+         "id": (lambda t: t["id"], False), "priority": (lambda t: PRIORITIES.index(t["priority"]), True),
+         "status": (lambda t: STATUSES.index(t["status"]), False)}
+
+
 def print_table(rows):
     widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
     for row in rows:
@@ -153,7 +169,7 @@ def print_ticket(client, t):
     print(f"Status: {t['status']} · Priority: {t['priority']} · Type: {t['type']} · Service: {t['service']}")
     requester = t["requester"] + (" [bot]" if t.get("requester_is_bot") else "")
     print(f"Requester: {requester} · Assignee: {name(t['assignee'])}")
-    print(f"Created: {t['created']} · Updated: {t['updated']}")
+    print(f"Created: {stamp(t['created'], True)} · Updated: {stamp(t['updated'], True)}")
     if t.get("group"):
         members = "  ".join(("★" if m["is_parent"] else "↳") + label(m["id"]) for m in t["group"]["members"])
         print(f"Group: {members}")
@@ -166,9 +182,9 @@ def print_ticket(client, t):
     for c in comments:
         author = c["author"] + (" [bot]" if c.get("author_is_bot") else "")
         if c["kind"] == "system":
-            print(f"  ◈ {c['created']}  {author} {c['body']}")
+            print(f"  ◈ {stamp(c['created'])}  {author} {c['body']}")
         else:
-            print(f"[{c['created']}] {author}:")
+            print(f"[{stamp(c['created'])}] {author}:")
             for line in c["body"].splitlines() or [""]:
                 print("    " + line)
     if not comments:
@@ -243,14 +259,18 @@ def cmd_list(client, args):
         tickets = [t for t in tickets if t["priority"] == args.priority]
     if args.mine:
         tickets = [t for t in tickets if t["requester_id"] == client.me()["id"]]
+    key, descending = SORTS[args.sort]
+    # Ties keep the newest ticket first (or last, reversed).
+    tickets.sort(key=lambda t: (key(t), t["id"]), reverse=descending != args.reverse)
     if args.json:
         return print(json.dumps(tickets, indent=2, ensure_ascii=False))
     if not tickets:
         return print("No matching tickets.", file=sys.stderr)
-    rows = [("ID", "STATUS", "PRIORITY", "TYPE", "SERVICE", "ASSIGNEE", "TITLE")]
+    rows = [("ID", "STATUS", "PRIORITY", "TYPE", "SERVICE", "ASSIGNEE", "UPDATED", "CREATED", "TITLE")]
     for t in tickets:
         title = t["title"] if len(t["title"]) <= 70 else t["title"][:69] + "…"
-        rows.append((label(t["id"]), t["status"], t["priority"], t["type"], t["service"], name(t["assignee"], "-"), title))
+        rows.append((label(t["id"]), t["status"], t["priority"], t["type"], t["service"], name(t["assignee"], "-"),
+                     stamp(t["updated"]), stamp(t["created"]), title))
     print_table(rows)
 
 
@@ -347,6 +367,9 @@ exit codes: 0 ok, 1 request refused by the server, 2 usage/config error, 3 serve
     p.add_argument("--mine", action="store_true", help="only tickets you requested")
     p.add_argument("--type", type=choice(TYPES, "type"))
     p.add_argument("--priority", type=priority)
+    p.add_argument("--sort", choices=tuple(SORTS), default="updated",
+                   help="updated (default) and created list newest first, priority highest first, id and status ascending")
+    p.add_argument("--reverse", "-r", action="store_true", help="reverse the --sort order (e.g. oldest first)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_list)
 

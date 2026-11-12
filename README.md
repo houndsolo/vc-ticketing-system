@@ -105,6 +105,7 @@ dt whoami
 dt new --title "Jellyfin transcodes stall" --service Jellyfin --priority High --description - < notes.txt
 dt new --title "Add AdGuard" --type Request --service Network --description "From Haystack" --assignee haystack
 dt list                              # unresolved tickets; --all, --status, --assignee me|none|USER, --mine, --type, --priority, --json
+                                     # --sort updated|created|id|priority|status (dates newest first), -r reverses
 dt show DT-007                       # ticket and conversation; --json for the raw object
 dt comment DT-007 --body "Checked the GPU passthrough; it's the ffmpeg preset."
 echo "Longer update" | dt comment 7 --body -
@@ -210,6 +211,16 @@ Create a ticket with a title, details, service, and priority. You are recorded a
 - **Admins** can delete a ticket and its whole conversation (Delete button in the ticket view, with a confirmation;
   `DELETE /api/tickets/:id`; `dt delete DT-007`). Other users and bots get 403. Deleting is permanent.
 
+
+### Timestamps and sorting
+- The list has **Updated** and **Created** columns ("5 min ago", "3 h ago", then the date; hover for the exact
+  local time). Board cards and the ticket view show both too. "Updated" moves on any change: a field edit,
+  a posted update, or a group change.
+- Click a column header to sort; date columns sort newest first on the first click, then oldest first, then
+  back to the default order (most recently updated first, as the server returns it). The **sort menu** in the
+  toolbar (Recently updated, Least recently updated, Newest first, Oldest first) does the same and also orders
+  the board. The choice is remembered per browser.
+- `dt list` prints UPDATED and CREATED in local time; `--sort updated|created|id|priority|status`, `-r` reverses.
 
 ### Ticket groups
 - Group related tickets under one **parent** (one level: a parent can't itself be in a group). In the ticket view,

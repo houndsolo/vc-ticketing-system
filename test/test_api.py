@@ -865,6 +865,19 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.dt("update", label, "--status", "Resolved", token=token).returncode, 0)
         self.assertEqual(json.loads(self.dt("list", "--json", token=token).stdout), [])  # unresolved by default
         self.assertEqual(len(json.loads(self.dt("list", "--json", "--all", token=token).stdout)), 1)
+        # --sort created|updated (newest first; --reverse flips). Touching the older ticket moves it up by updated.
+        second = int(self.dt("new", "--title", "Second", "--service", "Plex", "--description", "x", token=token).stdout.split()[0][3:])
+        ids = lambda *a: [t["id"] for t in json.loads(self.dt("list", "--json", "--all", *a, token=token).stdout)]
+        self.assertEqual(ids("--sort", "created"), [second, ticket_id])
+        self.assertEqual(ids("--sort", "created", "--reverse"), [ticket_id, second])
+        self.dt("comment", label, "--body", "bump", token=token)
+        self.assertEqual(ids("--sort", "updated"), [ticket_id, second])
+        self.assertEqual(ids("-r"), [second, ticket_id])
+        self.assertEqual(ids("--sort", "id"), [ticket_id, second])
+        table = self.dt("list", "--all", token=token).stdout
+        self.assertIn("UPDATED", table)
+        self.assertRegex(table, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
+        self.assertEqual(self.dt("update", str(second), "--status", "Canceled", token=token).returncode, 0)
         # Errors: clear messages and distinct exit codes.
         missing = self.dt("show", "DT-999", token=token)
         self.assertEqual(missing.returncode, 1)

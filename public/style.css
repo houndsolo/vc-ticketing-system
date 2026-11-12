@@ -196,3 +196,6 @@ tbody tr.child-row .tree{color:#1fbfb0;margin-right:6px}
 .board-card{cursor:pointer}
 .board-card.child-card{margin-left:14px;width:calc(100% - 14px);background:#0a2329;border-color:#18404a;border-left:3px solid #1fbfb0}
 .board-card .caret{float:right;margin:0}
+time.when{white-space:nowrap;color:var(--faint);font-size:12px;cursor:help}
+.card-when{margin-top:8px;font-size:11px;color:var(--faint)}.card-when time.when{font-size:11px}
+.detail-when time.when{color:inherit}
