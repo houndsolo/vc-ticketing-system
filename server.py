@@ -97,10 +97,15 @@ MIGRATIONS = (
     ("users", "color", "TEXT"),
     # Bot accounts (AI agents, scripts): no password, API tokens only.
     ("users", "is_bot", "INTEGER NOT NULL DEFAULT 0"),
+    # Ticket groups, one level deep: a child points at its group's parent ticket. No foreign key
+    # (import-sqlite copies tickets in id order, and a parent can be newer than its children);
+    # the API keeps it consistent and DELETE ungroups a deleted parent's children.
+    ("tickets", "parent_id", "INTEGER"),
 )
 TOKEN_PREFIX = "dt_"
 BOT_PASSWORD_HASH = "!bot"  # never matches: bots can't sign in with a password
-POST_MIGRATION = "CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee_id);"
+POST_MIGRATION = ("CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee_id);\n"
+                  "CREATE INDEX IF NOT EXISTS tickets_parent ON tickets(parent_id);")
 # PostgreSQL advisory lock keys ("dtriage" in ASCII, +1). MIGRATION_LOCK serializes schema
 # changes, the first-admin bootstrap and import-sqlite across instances; ADMIN_LOCK serializes
 # user-management requests (the last-admin check), like BEGIN IMMEDIATE does on SQLite.
@@ -114,9 +119,11 @@ TICKET_COLUMNS = ("t.id,t.title,t.description,t.type,t.priority,t.service,"
                   "a.username AS assignee_username,a.display_name AS assignee_display_name,"
                   "a.disabled AS assignee_disabled,a.color AS assignee_color,"
                   "u.username AS requester_username,u.color AS requester_custom_color,"
-                  "u.is_bot AS requester_is_bot,a.is_bot AS assignee_is_bot")
+                  "u.is_bot AS requester_is_bot,a.is_bot AS assignee_is_bot,"
+                  "t.parent_id,p.title AS parent_title,p.status AS parent_status,"
+                  "(SELECT COUNT(*) FROM tickets k WHERE k.parent_id=t.id) AS child_count")
 TICKET_QUERY = (f"SELECT {TICKET_COLUMNS} FROM tickets t LEFT JOIN users u ON u.id=t.requester_id "
-                "LEFT JOIN users a ON a.id=t.assignee_id")
+                "LEFT JOIN users a ON a.id=t.assignee_id LEFT JOIN tickets p ON p.id=t.parent_id")
 COMMENT_QUERY = ("SELECT c.id,c.ticket_id,COALESCE(u.display_name,c.author) AS author,c.author_id,"
                  "c.body,c.created,c.kind,u.username AS author_username,u.color AS author_custom_color,"
                  "u.is_bot AS author_is_bot "
@@ -334,7 +341,14 @@ def ticket_json(row):
         "display_name": row["assignee_display_name"], "disabled": bool(row["assignee_disabled"]),
         "color": effective_color(row["assignee_color"], row["assignee_username"]),
         "is_bot": bool(row["assignee_is_bot"])}
+    ticket["parent"] = None if row["parent_id"] is None or row["parent_title"] is None else {
+        "id": row["parent_id"], "title": row["parent_title"], "status": row["parent_status"]}
+    ticket["child_count"] = int(row["child_count"] or 0)
     return ticket
+
+
+def dt_label(ticket_id):
+    return f"DT-{ticket_id:03d}"
 
 
 def comment_json(row):
@@ -821,7 +835,7 @@ class Handler(BaseHTTPRequestHandler):
                     record_activity(db, ticket_id, user, assignment_activity(None, assignee), timestamp)
                 return 201, ticket_json(db.execute(TICKET_QUERY + " WHERE t.id=?", (ticket_id,)).fetchone())
             raise RequestError(405, "Method not allowed")
-        match = re.fullmatch(r"/api/tickets/([0-9]{1,18})(/comments)?", path)
+        match = re.fullmatch(r"/api/tickets/([0-9]{1,18})(/comments|/make-parent)?", path)
         if not match:
             raise RequestError(404, "Endpoint not found")
         ticket_id = int(match[1])
@@ -833,8 +847,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "PATCH" and not match[2]:
             # Partial update: any of status, priority, assignee_id.
             x = self.body()
-            if not any(k in x for k in ("status", "priority", "assignee_id")):
-                raise RequestError(400, "Nothing to update: send status, priority, or assignee_id.")
+            if not any(k in x for k in ("status", "priority", "assignee_id", "parent_id")):
+                raise RequestError(400, "Nothing to update: send status, priority, assignee_id, or parent_id.")
             status, priority = x.get("status", row["status"]), x.get("priority", row["priority"])
             if status not in STATUSES or priority not in PRIORITIES:
                 raise RequestError(400, "Invalid status or priority")
@@ -848,10 +862,15 @@ class Handler(BaseHTTPRequestHandler):
                 assignee = assignable_user(db, x["assignee_id"])
                 assignee_id = assignee["id"] if assignee else None
                 record_activity(db, ticket_id, user, assignment_activity(row["assignee_display_name"], assignee), timestamp)
-            db.execute("UPDATE tickets SET status=?,priority=?,assignee_id=?,updated=? WHERE id=?",
-                       (status, priority, assignee_id, timestamp, ticket_id))
+            parent_id = row["parent_id"]
+            if "parent_id" in x and x["parent_id"] != row["parent_id"]:
+                parent_id = self.set_parent(db, row, x["parent_id"], user, timestamp)
+            db.execute("UPDATE tickets SET status=?,priority=?,assignee_id=?,parent_id=?,updated=? WHERE id=?",
+                       (status, priority, assignee_id, parent_id, timestamp, ticket_id))
             return 200, self.ticket_detail(db, ticket_id)
-        if self.command == "POST" and match[2]:
+        if self.command == "POST" and match[2] == "/make-parent":
+            return 200, self.make_parent(db, row, user)
+        if self.command == "POST" and match[2] == "/comments":
             x = self.body()
             if not valid(x.get("body"), 5000):
                 raise RequestError(400, "Write a comment first.")
@@ -864,14 +883,69 @@ class Handler(BaseHTTPRequestHandler):
             # Admins only. Permanent: the ticket and its whole conversation (activity lines included).
             if user["role"] != "admin":
                 raise RequestError(403, "Only admins can delete tickets.")
+            timestamp = now()
+            for (child,) in db.execute("SELECT id FROM tickets WHERE parent_id=?", (ticket_id,)).fetchall():
+                record_activity(db, child, user, f"deleted the group's parent {dt_label(ticket_id)}; this ticket is ungrouped", timestamp)
+            db.execute("UPDATE tickets SET parent_id=NULL WHERE parent_id=?", (ticket_id,))
             db.execute("DELETE FROM comments WHERE ticket_id=?", (ticket_id,))
             db.execute("DELETE FROM tickets WHERE id=?", (ticket_id,))
             return 200, {"ok": True, "deleted": ticket_id}
         raise RequestError(405, "Method not allowed")
 
+    def set_parent(self, db, row, new_parent, user, timestamp):
+        """Move a ticket into a group (or out of it, new_parent None). Groups are one level deep:
+        the new parent can't itself be a child, and the ticket's own children join the new group."""
+        ticket_id = row["id"]
+        if new_parent is not None:
+            if not isinstance(new_parent, int) or isinstance(new_parent, bool):
+                raise RequestError(400, "parent_id must be a ticket id or null.")
+            if new_parent == ticket_id:
+                raise RequestError(400, "A ticket can't be its own parent.")
+            parent = db.execute("SELECT id,parent_id FROM tickets WHERE id=?", (new_parent,)).fetchone()
+            if parent is None:
+                raise RequestError(400, f"{dt_label(new_parent)} doesn't exist.")
+            if parent["parent_id"] is not None:
+                raise RequestError(400, f"{dt_label(new_parent)} is in {dt_label(parent['parent_id'])}'s group; "
+                                        f"choose {dt_label(parent['parent_id'])} as the parent.")
+            moved = [r[0] for r in db.execute("SELECT id FROM tickets WHERE parent_id=?", (ticket_id,)).fetchall()]
+            if moved:  # this ticket's own group joins the new one
+                db.execute("UPDATE tickets SET parent_id=?,updated=? WHERE parent_id=?", (new_parent, timestamp, ticket_id))
+                for child in moved:
+                    record_activity(db, child, user, f"moved this to {dt_label(new_parent)}'s group "
+                                                     f"(with its parent {dt_label(ticket_id)})", timestamp)
+            record_activity(db, ticket_id, user, f"added this to {dt_label(new_parent)}'s group", timestamp)
+            record_activity(db, new_parent, user, f"added {dt_label(ticket_id)} to this group", timestamp)
+            db.execute("UPDATE tickets SET updated=? WHERE id=?", (timestamp, new_parent))
+        else:
+            record_activity(db, ticket_id, user, f"removed this from {dt_label(row['parent_id'])}'s group", timestamp)
+            record_activity(db, row["parent_id"], user, f"removed {dt_label(ticket_id)} from this group", timestamp)
+        return new_parent
+
+    def make_parent(self, db, row, user):
+        """Make a child the parent of its group: the old parent and the siblings become its children."""
+        ticket_id, old = row["id"], row["parent_id"]
+        if old is None:
+            raise RequestError(400, f"{dt_label(ticket_id)} isn't a child in a group, so it can't be promoted."
+                               if not row["child_count"] else f"{dt_label(ticket_id)} is already the group's parent.")
+        timestamp = now()
+        db.execute("UPDATE tickets SET parent_id=?,updated=? WHERE (parent_id=? AND id<>?) OR id=?",
+                   (ticket_id, timestamp, old, ticket_id, old))
+        db.execute("UPDATE tickets SET parent_id=NULL,updated=? WHERE id=?", (timestamp, ticket_id))
+        for (member,) in db.execute("SELECT id FROM tickets WHERE parent_id=?", (ticket_id,)).fetchall():
+            record_activity(db, member, user, f"made {dt_label(ticket_id)} the group's parent (was {dt_label(old)})", timestamp)
+        record_activity(db, ticket_id, user, f"made this the group's parent (was {dt_label(old)})", timestamp)
+        return self.ticket_detail(db, ticket_id)
+
     def ticket_detail(self, db, ticket_id):
         ticket = ticket_json(db.execute(TICKET_QUERY + " WHERE t.id=?", (ticket_id,)).fetchone())
         ticket["comments"] = [comment_json(c) for c in db.execute(COMMENT_QUERY + " WHERE c.ticket_id=? ORDER BY c.id", (ticket_id,))]
+        # The whole group (parent first), when this ticket is in one.
+        root = ticket["parent"]["id"] if ticket["parent"] else (ticket_id if ticket["child_count"] else None)
+        ticket["group"] = None if root is None else {"parent_id": root, "members": [
+            {"id": r["id"], "title": r["title"], "status": r["status"], "priority": r["priority"],
+             "is_parent": r["id"] == root}
+            for r in db.execute("SELECT id,title,status,priority FROM tickets WHERE id=? OR parent_id=? "
+                                "ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END, id", (root, root, root))]}
         return ticket
 
     do_GET = handle_request

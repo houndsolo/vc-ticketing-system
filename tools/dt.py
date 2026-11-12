@@ -154,6 +154,9 @@ def print_ticket(client, t):
     requester = t["requester"] + (" [bot]" if t.get("requester_is_bot") else "")
     print(f"Requester: {requester} · Assignee: {name(t['assignee'])}")
     print(f"Created: {t['created']} · Updated: {t['updated']}")
+    if t.get("group"):
+        members = "  ".join(("★" if m["is_parent"] else "↳") + label(m["id"]) for m in t["group"]["members"])
+        print(f"Group: {members}")
     print(f"URL: {client.url(t['id'])}")
     print()
     print(t["description"])
@@ -275,6 +278,12 @@ def cmd_delete(client, args):
     print(f"Deleted {label(args.id)}")
 
 
+def cmd_make_parent(client, args):
+    ticket = client.call(f"/tickets/{args.id}/make-parent", "POST")
+    members = ", ".join(label(m["id"]) for m in ticket["group"]["members"] if not m["is_parent"])
+    print(f"{label(args.id)} is now the parent of its group ({members})")
+
+
 def cmd_update(client, args):
     changes = {}
     if args.status:
@@ -283,8 +292,10 @@ def cmd_update(client, args):
         changes["priority"] = args.priority
     if args.assignee is not None:
         changes["assignee_id"] = client.resolve_user(args.assignee)
+    if args.parent is not None:
+        changes["parent_id"] = None if args.parent.lower() == "none" else ticket_id(args.parent)
     if not changes:
-        raise DtError("nothing to update: pass --status, --priority and/or --assignee", 2)
+        raise DtError("nothing to update: pass --status, --priority, --assignee and/or --parent", 2)
     ticket = client.call(f"/tickets/{args.id}", "PATCH", changes)
     if args.json:
         return print(json.dumps(ticket, indent=2, ensure_ascii=False))
@@ -359,8 +370,13 @@ exit codes: 0 ok, 1 request refused by the server, 2 usage/config error, 3 serve
     p.add_argument("--status", type=status)
     p.add_argument("--priority", type=priority)
     p.add_argument("--assignee", metavar="USERNAME|me|none", help="none unassigns")
+    p.add_argument("--parent", metavar="DT-###|none", help="put the ticket in that ticket's group; none ungroups it")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_update)
+
+    p = commands.add_parser("make-parent", help="make a grouped ticket the parent of its group")
+    p.add_argument("id", type=ticket_id, metavar="DT-###|ID")
+    p.set_defaults(func=cmd_make_parent)
     return parser
 
 

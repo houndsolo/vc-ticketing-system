@@ -210,6 +210,18 @@ Create a ticket with a title, details, service, and priority. You are recorded a
 - **Admins** can delete a ticket and its whole conversation (Delete button in the ticket view, with a confirmation;
   `DELETE /api/tickets/:id`; `dt delete DT-007`). Other users and bots get 403. Deleting is permanent.
 
+
+### Ticket groups
+- Group related tickets under one **parent** (one level: a parent can't itself be in a group). In the ticket view,
+  pick **Parent ticket** and Save; a ticket that already has children brings them along.
+- The **Group** panel lists the parent (★) and its children; **Make parent** on any child makes it the new parent
+  (the old parent and the siblings become its children). Activity lines record every change.
+- The list and board show `▣ N` on a parent (group size) and `↳ DT-###` on a child. Deleting a parent ungroups its children.
+- API: `PATCH /api/tickets/:id {"parent_id": id|null}`, `POST /api/tickets/:id/make-parent`; tickets carry
+  `parent`, `child_count` and (detail) `group`. dt: `dt update ID --parent DT-5|none`, `dt make-parent ID`.
+- The ticket view shows the controls (status, priority, assignee, parent) first, then the group, then the problem
+  description as the opening post, then the follow-up conversation.
+
 ## Assignment
 
 Each ticket has at most one **assignee**: an account, or nobody. Everyone can set, change, or clear the assignee on any ticket. Assignment uses the same shared ticket rights as status and priority.

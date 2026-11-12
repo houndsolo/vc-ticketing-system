@@ -197,6 +197,48 @@ class ApiTests(unittest.TestCase):
         status, t2, _ = self.call("/api/tickets", "POST", self.ticket(), self.admin)
         self.assertEqual(status, 201, t2)
 
+    def test_ticket_groups(self):
+        _, user = self.activate("haystack")
+        new = lambda: self.call("/api/tickets", "POST", self.ticket(), user)[1]["id"]
+        a, b, c, d, e = new(), new(), new(), new(), new()
+        patch = lambda t, pid, token=user: self.call(f"/api/tickets/{t}", "PATCH", {"parent_id": pid}, token)
+        # b and c join a's group (any signed-in user can group tickets)
+        self.assertEqual(patch(b, a)[0], 200)
+        status, dc, _ = patch(c, a)
+        self.assertEqual(status, 200, dc)
+        self.assertEqual(dc["parent"]["id"], a)
+        self.assertEqual([(m["id"], m["is_parent"]) for m in dc["group"]["members"]], [(a, True), (b, False), (c, False)])
+        da = self.call(f"/api/tickets/{a}", token=user)[1]
+        self.assertEqual((da["child_count"], da["parent"]), (2, None))
+        # one level: can't use a child as a parent, can't parent itself, unknown ticket
+        self.assertEqual(patch(d, b)[0], 400)
+        self.assertEqual(patch(d, d)[0], 400)
+        self.assertEqual(patch(d, 999999)[0], 400)
+        self.assertEqual(self.call(f"/api/tickets/{d}", "PATCH", {"parent_id": "1"}, user)[0], 400)
+        # d becomes a parent of e; then d joins a's group -> e moves along (flattened)
+        self.assertEqual(patch(e, d)[0], 200)
+        self.assertEqual(patch(d, a)[0], 200)
+        self.assertEqual(self.call(f"/api/tickets/{e}", token=user)[1]["parent"]["id"], a)
+        # make c the parent: a, b, d, e become c's children
+        status, dp, _ = self.call(f"/api/tickets/{c}/make-parent", "POST", {}, user)
+        self.assertEqual(status, 200, dp)
+        self.assertEqual(dp["group"]["parent_id"], c)
+        self.assertEqual(sorted(m["id"] for m in dp["group"]["members"] if not m["is_parent"]), sorted([a, b, d, e]))
+        self.assertEqual(self.call(f"/api/tickets/{c}/make-parent", "POST", {}, user)[0], 400)  # already the parent
+        # activity lines record it
+        bodies = [x["body"] for x in self.call(f"/api/tickets/{a}", token=user)[1]["comments"] if x["kind"] == "system"]
+        self.assertTrue(any("made DT-" in s and "group's parent" in s for s in bodies), bodies)
+        # ungroup b
+        self.assertIsNone(patch(b, None)[1]["parent"])
+        # deleting the parent ungroups the rest
+        self.assertEqual(self.call(f"/api/tickets/{c}", "DELETE", None, self.admin)[0], 200)
+        for t in (a, d, e):
+            dt_ = self.call(f"/api/tickets/{t}", token=user)[1]
+            self.assertIsNone(dt_["parent"], t)
+        # list rows carry parent/child_count for the UI chips
+        rows = {r["id"]: r for r in self.call(token=user)[1]}
+        self.assertIn("child_count", rows[a])
+
     # --- accounts ------------------------------------------------------------
 
     def test_bootstrap_admin_login_and_logout(self):
