@@ -1,13 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <!-- dark-triage mark (◈): outlined diamond with a solid core, accent #f70997 on the app background #010304 -->
-  <defs>
-    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
-      <stop offset="0" stop-color="#9932cc" stop-opacity=".45"/>
-      <stop offset=".6" stop-color="#9932cc" stop-opacity="0"/>
-    </radialGradient>
-  </defs>
-  <rect width="64" height="64" rx="14" fill="#010304"/>
-  <circle cx="32" cy="32" r="30" fill="url(#glow)"/>
-  <path d="M32 5 59 32 32 59 5 32Z" fill="none" stroke="#f70997" stroke-width="6" stroke-linejoin="round"/>
-  <path d="M32 22 42 32 32 42 22 32Z" fill="#f70997"/>
+  <!-- dark-triage mark (◈): outlined diamond with a solid core in the accent #f70997, transparent background -->
+  <path d="M32 4 60 32 32 60 4 32Z" fill="none" stroke="#f70997" stroke-width="6" stroke-linejoin="round"/>
+  <path d="M32 21 43 32 32 43 21 32Z" fill="#f70997"/>
 </svg>
