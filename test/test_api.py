@@ -433,7 +433,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.call(method="POST", raw=b"x" * 24001, token=self.admin)[0], 413)
         self.assertEqual(self.call(method="DELETE", token=self.admin)[0], 405)
         self.assertEqual(self.call("/../server.py")[0], 404)
-        for path, expected in (("/", b"dark-triage"), ("/app.js", b"'/login'"), ("/style.css", b":root")):
+        for path, expected in (("/", b"dark-triage"), ("/app.js", b"'/login'"), ("/style.css", b":root"),
+                               ("/favicon.svg", b"<svg"), ("/favicon.ico", b"\x00\x00\x01\x00"),
+                               ("/apple-touch-icon.png", b"\x89PNG")):
             status, body, headers = self.call(path)
             self.assertEqual(status, 200)
             self.assertIn(expected, body)
