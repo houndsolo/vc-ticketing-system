@@ -317,3 +317,22 @@ tbody.folder:not(.open) .folder-icon{color:var(--faint);text-shadow:none}
 .change-window .form-grid,.window-grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
 .change-window input,.window-box input{min-width:0;max-width:100%}
 .window-box input:required:invalid,.change-window input:required:invalid{border-color:var(--error)}
+/* Time fields: one typed box with calendar, Now and clear buttons, and a live reading of what was typed */
+.when-wrap{min-width:0}
+.when-field{display:flex;align-items:stretch;background:var(--bg);border:1px solid var(--border-strong);border-radius:6px;min-width:0}
+.when-field:focus-within{border-color:var(--accent-2);box-shadow:0 0 0 1px var(--accent-2)}
+form .when-field input.when-text{flex:1;min-width:0;border:0;background:none;padding:10px 11px;font-family:ui-monospace,monospace;font-size:14px;outline:none;box-shadow:none}
+form .when-field input.when-text::placeholder{font-family:system-ui,sans-serif;font-size:12px;color:var(--faint)}
+.when-field:has(.when-text:required:invalid){border-color:var(--error)}
+.when-field:has(.when-text:required:invalid):focus-within{box-shadow:0 0 0 1px var(--error)}
+.when-btn{flex:none;background:none;border:0;border-left:1px solid var(--border);color:var(--muted);padding:0 10px;font-size:13px;line-height:1}
+.when-btn:hover{color:var(--accent-2);background:rgba(33,226,215,.06)}
+.when-btn[data-when-clear]:hover{color:var(--error);background:rgba(255,97,136,.07)}
+.when-btn.text{font-size:12px;font-weight:600;letter-spacing:.3px}
+.when-field>.when-btn:last-child{border-radius:0 5px 5px 0}
+.when-pick-wrap{position:relative;display:flex}
+form .when-field input.when-picker{position:absolute;inset:auto 0 0 auto;width:1px;height:1px;padding:0;border:0;opacity:0;pointer-events:none}
+.when-hint{display:block;min-height:16px;margin-top:4px;font-size:11px;color:var(--muted)}
+.when-hint.bad{color:var(--error)}
+.window-box .when-hint{margin-bottom:2px}
+@media(max-width:760px){.change-window .form-grid,.window-grid{grid-template-columns:minmax(0,1fr)}form .when-field input.when-text{min-width:10ch}}

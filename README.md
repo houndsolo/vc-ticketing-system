@@ -212,8 +212,14 @@ Create a ticket with a title, details, service, and priority. You are recorded a
   Change (prefilled with the next full hour, one hour long; moving the start keeps the length). Times are entered
   and shown in the browser's timezone and stored as UTC.
 - It is **resolved** only once its **actual start and end** are recorded. In the ticket view the Change window panel
-  holds all four times (each actual one has a **Now** button). Picking Resolved marks the actual fields required.
+  holds all four times. Picking Resolved marks the actual fields required.
   Canceled needs no actual times. You can record the actual start alone while the change runs.
+- **Time fields** are one text box each, read as you type in browser local time: `11/14 2:30pm`, `11/14/2026 14:30`,
+  `2026-11-14 02:00`, `tomorrow 9am`, `fri 14:00`, `14:30` (today), `now`, `in 30m`. In an end field `+2h` and a bare
+  time count from the start (`01:30` after a 22:00 start is the next day). The line under the box shows how it was
+  read (weekday, date, time, "in 4 h", length after the start) or why it couldn't be. Buttons: ▦ opens the native
+  calendar picker, **Now**, and ✕ clears. ↑/↓ step 15 minutes (Shift: 1 hour). The text is tidied to
+  `mm/dd/yyyy hh:mm` when you leave the box.
 - Rules (server-side): ISO 8601 with a timezone; end after start; actual times can't be in the future (5 min of clock
   skew allowed); the planned window can be moved but not removed. Changes filed before windows existed keep empty
   windows and can still be edited and canceled; resolving them still needs the actual window.
