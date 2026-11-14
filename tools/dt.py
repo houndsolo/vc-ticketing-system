@@ -13,7 +13,7 @@ permissions), 2 usage or configuration error, 3 the server could not be reached.
 """
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -57,6 +57,28 @@ def ticket_id(value):
     if not match:
         raise argparse.ArgumentTypeError(f"not a ticket id: {value!r} (use DT-007 or 7)")
     return int(match[1])
+
+
+WINDOW_ARGS = (("planned_start", "--planned-start"), ("planned_end", "--planned-end"),
+               ("actual_start", "--actual-start"), ("actual_end", "--actual-end"))
+
+
+def when_arg(value):
+    """argparse type for change-window times: 'now', ISO 8601 with a timezone, or a local time like
+    '2026-11-14 02:00' (read in this machine's timezone). Sent to the server as UTC ISO 8601."""
+    text = value.strip()
+    if text.lower() == "now":
+        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    if text.lower() == "none":
+        return None
+    try:
+        moment = datetime.fromisoformat(text[:-1] + "+00:00" if text[-1:] in "Zz" else text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a date and time: {value!r} (e.g. '2026-11-14 02:00', "
+                                         "2026-11-14T07:00Z or now)") from None
+    if moment.tzinfo is None:
+        moment = moment.astimezone()  # local time
+    return moment.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def label(ticket_id_value):
@@ -170,6 +192,10 @@ def print_ticket(client, t):
     requester = t["requester"] + (" [bot]" if t.get("requester_is_bot") else "")
     print(f"Requester: {requester} · Assignee: {name(t['assignee'])}")
     print(f"Created: {stamp(t['created'], True)} · Updated: {stamp(t['updated'], True)}")
+    if t["type"] == "Change":
+        window = lambda a, b: f"{stamp(a)} → {stamp(b)}" if a or b else "not recorded"
+        print(f"Planned: {window(t.get('planned_start'), t.get('planned_end'))} · "
+              f"Actual: {window(t.get('actual_start'), t.get('actual_end'))}")
     if t.get("group"):
         members = "  ".join(("★" if m["is_parent"] else "↳") + label(m["id"]) for m in t["group"]["members"])
         print(f"Group: {members}")
@@ -228,6 +254,13 @@ def cmd_new(client, args):
             "type": args.type, "priority": args.priority}
     if args.assignee is not None:
         data["assignee_id"] = client.resolve_user(args.assignee)
+    window = {field: getattr(args, field) for field, _ in WINDOW_ARGS[:2] if getattr(args, field) is not None}
+    if args.type == "Change" and len(window) < 2:
+        raise DtError("a Change needs its planned window: --planned-start and --planned-end "
+                      "(e.g. --planned-start '2026-11-14 02:00' --planned-end '2026-11-14 03:00', local time)", 2)
+    if window and args.type != "Change":
+        raise DtError("only Change tickets have a planned window", 2)
+    data.update(window)
     ticket = client.call("/tickets", "POST", data)
     if args.json:
         return print(json.dumps(ticket, indent=2, ensure_ascii=False))
@@ -314,12 +347,19 @@ def cmd_update(client, args):
         changes["assignee_id"] = client.resolve_user(args.assignee)
     if args.parent is not None:
         changes["parent_id"] = None if args.parent.lower() == "none" else ticket_id(args.parent)
+    for field, flag in WINDOW_ARGS:
+        if getattr(args, field, False) is not False:
+            changes[field] = getattr(args, field)
     if not changes:
-        raise DtError("nothing to update: pass --status, --priority, --assignee and/or --parent", 2)
+        raise DtError("nothing to update: pass --status, --priority, --assignee, --parent or a window time", 2)
     ticket = client.call(f"/tickets/{args.id}", "PATCH", changes)
     if args.json:
         return print(json.dumps(ticket, indent=2, ensure_ascii=False))
     print(f"{label(ticket['id'])}: {ticket['status']} · {ticket['priority']} · assignee {name(ticket['assignee'])}")
+    if ticket["type"] == "Change" and (any(f in changes for f, _ in WINDOW_ARGS) or changes.get("status") == "Resolved"):
+        window = lambda a, b: f"{stamp(a)} → {stamp(b)}" if a or b else "not recorded"
+        print(f"  planned {window(ticket['planned_start'], ticket['planned_end'])} · "
+              f"actual {window(ticket['actual_start'], ticket['actual_end'])}")
 
 
 def build_parser():
@@ -336,6 +376,10 @@ values:
   --priority  {', '.join(PRIORITIES)}
   --status    {', '.join(STATUSES)}  (case-insensitive; in-progress works)
   --service   free text, 1-80 characters; the web form suggests {', '.join(SERVICES)}
+  times       now, ISO 8601 with a timezone (2026-11-14T07:00Z), or local time ('2026-11-14 02:00')
+
+change windows: a Change is filed with --planned-start/--planned-end and resolved only once
+  --actual-start/--actual-end are recorded (e.g. update DT-9 --status resolved --actual-start '...' --actual-end now)
 
 exit codes: 0 ok, 1 request refused by the server, 2 usage/config error, 3 server unreachable""")
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -357,6 +401,8 @@ exit codes: 0 ok, 1 request refused by the server, 2 usage/config error, 3 serve
     p.add_argument("--type", type=choice(TYPES, "type"), default="Issue", help=" | ".join(TYPES) + " (default Issue)")
     p.add_argument("--priority", type=priority, default="Medium", help=" | ".join(PRIORITIES) + " (default Medium)")
     p.add_argument("--assignee", metavar="USERNAME|me", help="assign on creation")
+    p.add_argument("--planned-start", type=when_arg, metavar="TIME", help="Change: when it is planned to start (required)")
+    p.add_argument("--planned-end", type=when_arg, metavar="TIME", help="Change: when it is planned to end (required)")
     p.add_argument("--json", action="store_true", help="print the created ticket as JSON")
     p.set_defaults(func=cmd_new)
 
@@ -388,12 +434,15 @@ exit codes: 0 ok, 1 request refused by the server, 2 usage/config error, 3 serve
     p.add_argument("--yes", action="store_true", help="don't ask for confirmation")
     p.set_defaults(func=cmd_delete)
 
-    p = commands.add_parser("update", help="change status, priority or assignee")
+    p = commands.add_parser("update", help="change status, priority, assignee, group or a Change's window")
     p.add_argument("id", type=ticket_id, metavar="DT-###|ID")
     p.add_argument("--status", type=status)
     p.add_argument("--priority", type=priority)
     p.add_argument("--assignee", metavar="USERNAME|me|none", help="none unassigns")
     p.add_argument("--parent", metavar="DT-###|none", help="put the ticket in that ticket's group; none ungroups it")
+    for field, flag in WINDOW_ARGS:
+        p.add_argument(flag, dest=field, type=when_arg, default=False, metavar="TIME" + ("|none" if "actual" in field else ""),
+                       help=f"Change: {field.replace('_', ' ')}" + (" (needed to resolve)" if "actual" in field else " (reschedule)"))
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_update)
 

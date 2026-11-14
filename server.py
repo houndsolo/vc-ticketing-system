@@ -101,7 +101,15 @@ MIGRATIONS = (
     # (import-sqlite copies tickets in id order, and a parent can be newer than its children);
     # the API keeps it consistent and DELETE ungroups a deleted parent's children.
     ("tickets", "parent_id", "INTEGER"),
+    # Change windows (Change tickets only), UTC ISO 8601 like the other timestamps. A Change is filed with a
+    # planned window; it is resolved with the actual one. Older Change tickets keep NULLs.
+    ("tickets", "planned_start", "TEXT"),
+    ("tickets", "planned_end", "TEXT"),
+    ("tickets", "actual_start", "TEXT"),
+    ("tickets", "actual_end", "TEXT"),
 )
+WINDOW_FIELDS = ("planned_start", "planned_end", "actual_start", "actual_end")
+CLOCK_SKEW = 300  # seconds an "actual" time may lie in the future (client clocks drift)
 TOKEN_PREFIX = "dt_"
 BOT_PASSWORD_HASH = "!bot"  # never matches: bots can't sign in with a password
 POST_MIGRATION = ("CREATE INDEX IF NOT EXISTS tickets_assignee ON tickets(assignee_id);\n"
@@ -116,6 +124,7 @@ TABLES = ("users", "api_tokens", "sessions", "tickets", "comments")
 TICKET_COLUMNS = ("t.id,t.title,t.description,t.type,t.priority,t.service,"
                   "COALESCE(u.display_name,t.requester) AS requester,t.requester_id,"
                   "t.status,t.created,t.updated,t.assignee_id,"
+                  "t.planned_start,t.planned_end,t.actual_start,t.actual_end,"
                   "a.username AS assignee_username,a.display_name AS assignee_display_name,"
                   "a.disabled AS assignee_disabled,a.color AS assignee_color,"
                   "u.username AS requester_username,u.color AS requester_custom_color,"
@@ -332,7 +341,7 @@ def token_json(row):
 
 def ticket_json(row):
     ticket = {k: row[k] for k in ("id", "title", "description", "type", "priority", "service", "requester",
-                                  "requester_id", "status", "created", "updated")}
+                                  "requester_id", "status", "created", "updated") + WINDOW_FIELDS}
     # Legacy tickets without an account fall back to the stored requester name.
     ticket["requester_color"] = effective_color(row["requester_custom_color"], row["requester_username"] or row["requester"])
     ticket["requester_is_bot"] = bool(row["requester_is_bot"])
@@ -345,6 +354,71 @@ def ticket_json(row):
         "id": row["parent_id"], "title": row["parent_title"], "status": row["parent_status"]}
     ticket["child_count"] = int(row["child_count"] or 0)
     return ticket
+
+
+def parse_moment(value, field):
+    """An ISO 8601 date-time with a timezone, normalized to the UTC form now() writes (so strings compare in order)."""
+    problem = f"{field} must be an ISO 8601 date and time with a timezone, e.g. 2026-11-14T02:00:00Z."
+    if not isinstance(value, str) or not 10 <= len(value.strip()) <= 40:
+        raise RequestError(400, problem)
+    text = value.strip()
+    if text[-1] in "Zz":
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        raise RequestError(400, problem) from None
+    if moment.tzinfo is None:
+        raise RequestError(400, f"{field} needs a timezone (Z or an offset like -05:00).")
+    return moment.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def short_moment(iso):
+    return iso[:16].replace("T", " ") + "Z" if iso else "none"
+
+
+def change_window(x, kind, old, status, old_status):
+    """Validate the window fields of a create (old None) or update. Returns {field: value} to store, only for fields
+    that were sent. Change tickets need a planned window when filed and an actual window when resolved."""
+    sent = {f: x[f] for f in WINDOW_FIELDS if f in x}
+    if kind != "Change":
+        if any(v is not None for v in sent.values()):
+            raise RequestError(400, "Only Change tickets have planned and actual windows.")
+        return {}
+    values = {f: (old[f] if old is not None else None) for f in WINDOW_FIELDS}
+    for field, value in sent.items():
+        if value is None and field.startswith("planned"):
+            raise RequestError(400, "A Change keeps its planned window: send new times instead of null.")
+        values[field] = None if value is None else parse_moment(value, field)
+    if old is None and not (values["planned_start"] and values["planned_end"]):
+        raise RequestError(400, "A Change needs a planned window: send planned_start and planned_end.")
+    if bool(values["planned_start"]) != bool(values["planned_end"]):
+        raise RequestError(400, "Send both planned_start and planned_end.")
+    if values["planned_start"] and values["planned_end"] <= values["planned_start"]:
+        raise RequestError(400, "planned_end must be after planned_start.")
+    if values["actual_end"] and not values["actual_start"]:
+        raise RequestError(400, "Record actual_start along with actual_end.")
+    if values["actual_start"] and values["actual_end"] and values["actual_end"] <= values["actual_start"]:
+        raise RequestError(400, "actual_end must be after actual_start.")
+    limit = datetime.fromtimestamp(time.time() + CLOCK_SKEW, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    for field in ("actual_start", "actual_end"):
+        if field in sent and values[field] and values[field] > limit:
+            raise RequestError(400, f"{field} is in the future; record actual times once they have happened.")
+    if status == "Resolved" and old_status != "Resolved" and not (values["actual_start"] and values["actual_end"]):
+        raise RequestError(400, "Record when the change actually ran (actual_start and actual_end) to resolve it.",
+                           code="actual_window_required")
+    return {f: values[f] for f in sent}
+
+
+def window_activity(row, stored):
+    """Activity lines for window edits, e.g. a reschedule."""
+    lines = []
+    for kind, label in (("planned", "rescheduled the planned window to"), ("actual", "recorded the actual window:")):
+        start, end = f"{kind}_start", f"{kind}_end"
+        if any(f in stored and stored[f] != row[f] for f in (start, end)):
+            a, b = stored.get(start, row[start]), stored.get(end, row[end])
+            lines.append(f"{label} {short_moment(a)} → {short_moment(b)}" if a or b else f"cleared the {kind} window")
+    return lines
 
 
 def dt_label(ticket_id):
@@ -829,11 +903,13 @@ class Handler(BaseHTTPRequestHandler):
                 fields = {"title": 160, "description": 10000, "service": 80}
                 if not all(valid(x.get(k), limit) for k, limit in fields.items()) or x.get("type") not in TYPES or x.get("priority") not in PRIORITIES:
                     raise RequestError(400, "Complete all fields with valid values.")
+                window = change_window(x, x["type"], None, "Open", None)
                 assignee = assignable_user(db, x.get("assignee_id"))
                 timestamp = now()
-                ticket_id = db.insert("INSERT INTO tickets(title,description,type,priority,service,requester,requester_id,assignee_id,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ticket_id = db.insert("INSERT INTO tickets(title,description,type,priority,service,requester,requester_id,assignee_id,"
+                                      "planned_start,planned_end,actual_start,actual_end,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                       (x["title"].strip(), x["description"].strip(), x["type"], x["priority"], x["service"].strip(), user["display_name"], user["id"],
-                                       assignee["id"] if assignee else None, timestamp, timestamp))
+                                       assignee["id"] if assignee else None, *(window.get(f) for f in WINDOW_FIELDS), timestamp, timestamp))
                 if assignee:
                     record_activity(db, ticket_id, user, assignment_activity(None, assignee), timestamp)
                 return 201, ticket_json(db.execute(TICKET_QUERY + " WHERE t.id=?", (ticket_id,)).fetchone())
@@ -848,13 +924,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and not match[2]:
             return 200, self.ticket_detail(db, ticket_id)
         if self.command == "PATCH" and not match[2]:
-            # Partial update: any of status, priority, assignee_id.
+            # Partial update: any of status, priority, assignee_id, parent_id and (Changes) the window fields.
             x = self.body()
-            if not any(k in x for k in ("status", "priority", "assignee_id", "parent_id")):
-                raise RequestError(400, "Nothing to update: send status, priority, assignee_id, or parent_id.")
+            if not any(k in x for k in ("status", "priority", "assignee_id", "parent_id") + WINDOW_FIELDS):
+                raise RequestError(400, "Nothing to update: send status, priority, assignee_id, parent_id, "
+                                        "or a window field (planned_start, planned_end, actual_start, actual_end).")
             status, priority = x.get("status", row["status"]), x.get("priority", row["priority"])
             if status not in STATUSES or priority not in PRIORITIES:
                 raise RequestError(400, "Invalid status or priority")
+            window = change_window(x, row["type"], row, status, row["status"])
             assignee_id = row["assignee_id"]
             timestamp = now()
             requested = x.get("assignee_id")
@@ -868,8 +946,12 @@ class Handler(BaseHTTPRequestHandler):
             parent_id = row["parent_id"]
             if "parent_id" in x and x["parent_id"] != row["parent_id"]:
                 parent_id = self.set_parent(db, row, x["parent_id"], user, timestamp)
-            db.execute("UPDATE tickets SET status=?,priority=?,assignee_id=?,parent_id=?,updated=? WHERE id=?",
-                       (status, priority, assignee_id, parent_id, timestamp, ticket_id))
+            for line in window_activity(row, window):
+                record_activity(db, ticket_id, user, line, timestamp)
+            db.execute("UPDATE tickets SET status=?,priority=?,assignee_id=?,parent_id=?,planned_start=?,planned_end=?,"
+                       "actual_start=?,actual_end=?,updated=? WHERE id=?",
+                       (status, priority, assignee_id, parent_id, *(window.get(f, row[f]) for f in WINDOW_FIELDS),
+                        timestamp, ticket_id))
             return 200, self.ticket_detail(db, ticket_id)
         if self.command == "POST" and match[2] == "/make-parent":
             return 200, self.make_parent(db, row, user)

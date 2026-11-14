@@ -2,7 +2,7 @@
 
 A little chaos. A lot more clarity.
 
-A self-hosted helpdesk for your homelab and friends, built with Python's standard library and SQLite. No Node.js, npm, pip packages, or build step. Optionally it stores its data in PostgreSQL instead (one pip package, see [Storage backends](#storage-backends)). The browser uses plain HTML, CSS, and JavaScript. A dark interface with hot-pink and cyan accents, responsive layouts, a list, a kanban board and folders by service, live search, priority, service and status filters, and keyboard shortcuts.
+A self-hosted helpdesk for your homelab and friends, built with Python's standard library and SQLite. No Node.js, npm, pip packages, or build step. Optionally it stores its data in PostgreSQL instead (one pip package, see [Storage backends](#storage-backends)). The browser uses plain HTML, CSS, and JavaScript. A dark interface with hot-pink and cyan accents, responsive layouts, a list, a kanban board and folders by service, a change schedule (today's timeline and upcoming change windows), live search, priority, service and status filters, and keyboard shortcuts.
 
 ## Run with Docker
 
@@ -110,6 +110,9 @@ dt show DT-007                       # ticket and conversation; --json for the r
 dt comment DT-007 --body "Checked the GPU passthrough; it's the ffmpeg preset."
 echo "Longer update" | dt comment 7 --body -
 dt update DT-007 --status "In progress" --assignee me    # also --priority; --assignee none unassigns
+dt new --type Change --title "Spine BGP timers" --service Network --description - \
+   --planned-start "2026-11-14 02:00" --planned-end "2026-11-14 04:00" < plan.txt   # local time, or ISO with a zone
+dt update DT-009 --status resolved --actual-start "2026-11-14 02:05" --actual-end now
 dt users                             # usernames for --assignee
 ```
 
@@ -179,9 +182,9 @@ API changes: the `requester` field on `POST /api/tickets` and the `author` field
 | `PATCH /api/me` `{display_name?,color?}` | signed in | Change your display name (1–80 characters, trimmed) and/or avatar color (`"#rrggbb"`, or `null` for the default). Send at least one; an invalid value gets a 400 and nothing is changed. → updated user |
 | `POST /api/me/password` `{current_password,new_password}` | signed in | Clears `must_change`, signs out other sessions |
 | `GET /api/tickets?assignee=<id>\|me\|none` | signed in | All tickets, newest activity first; `assignee` is an optional filter (400 if it's anything else) |
-| `POST /api/tickets` `{title,description,service,priority,type,assignee_id?}` | signed in | → 201 ticket. You are the requester. `assignee_id` is a user id or `null` |
+| `POST /api/tickets` `{title,description,service,priority,type,assignee_id?,planned_start?,planned_end?}` | signed in | → 201 ticket. You are the requester. `assignee_id` is a user id or `null`. A `Change` needs `planned_start` and `planned_end` (see [Change windows](#change-windows)); other types refuse them |
 | `GET /api/tickets/:id` | signed in | Ticket plus `comments` (each with `kind`: `comment` or `system`) |
-| `PATCH /api/tickets/:id` `{status?,priority?,assignee_id?}` | signed in | Partial update; send at least one field. → updated ticket with comments |
+| `PATCH /api/tickets/:id` `{status?,priority?,assignee_id?,parent_id?,planned_start?,planned_end?,actual_start?,actual_end?}` | signed in | Partial update; send at least one field. Moving a `Change` to Resolved needs `actual_start` and `actual_end` (sent now or already stored), else 400 with `code: actual_window_required`. → updated ticket with comments |
 | `POST /api/tickets/:id/comments` `{body}` | signed in | Posts an update as you |
 | `GET /api/users/assignable` | signed in | `[{id, username, display_name, color}]` of active accounts, for the assignee picker |
 | `GET/POST /api/users`, `GET/PATCH /api/users/:id` `{display_name?,role?,disabled?,color?}`, `POST /api/users/:id/password` `{password}` | admin | 403 for users, 409 for duplicate username or last-admin protection. `POST /api/users` with `{"bot": true, username, display_name}` creates a bot (no password, role `user`) |
@@ -199,10 +202,34 @@ While `must_change` is true, everything except `/api/me`, `/api/me/password` and
 
 - **Issues:** report broken services, errors, or outages.
 - **Requests:** ask for a service, media, access, or something new.
-- **Changes:** propose upgrades, maintenance, and improvements. Include impact, timing, and rollback details in the description.
+- **Changes:** propose upgrades, maintenance, and improvements. Include impact and rollback details in the description; the timing goes in the change window.
 
 Create a ticket with a title, details, service, and priority. You are recorded as the requester. Open a ticket to move it through **Open → In progress → Waiting → Resolved**, adjust its priority, or post an update. Assign it to someone, or to yourself, so everyone knows who's on it. See [Assignment](#assignment) for the keyboard shortcuts. Resolved tickets remain searchable and can be reopened. The app starts empty, with no fabricated service health or demo tickets.
 
+
+### Change windows
+- A **Change** is filed with a **planned start and end**. The new-ticket form shows the two fields when you pick
+  Change (prefilled with the next full hour, one hour long; moving the start keeps the length). Times are entered
+  and shown in the browser's timezone and stored as UTC.
+- It is **resolved** only once its **actual start and end** are recorded. In the ticket view the Change window panel
+  holds all four times (each actual one has a **Now** button). Picking Resolved marks the actual fields required.
+  Canceled needs no actual times. You can record the actual start alone while the change runs.
+- Rules (server-side): ISO 8601 with a timezone; end after start; actual times can't be in the future (5 min of clock
+  skew allowed); the planned window can be moved but not removed. Changes filed before windows existed keep empty
+  windows and can still be edited and canceled; resolving them still needs the actual window.
+- Rescheduling and recording the actual window add activity lines ("rescheduled the planned window to …",
+  "recorded the actual window: …").
+- **Change schedule** (top of the Changes view): a timeline of the day with one lane per change, the planned window
+  as an outlined bar and the actual window as a solid one, plus a now line. The axis fits the day's changes (at
+  least 6 h); **full day** switches to 00–24 (remembered per browser). ‹ / Today / › step through days. Lanes are
+  colored by phase: scheduled, window open (planned start passed, not started yet), underway, past its window (planned end
+  passed, not closed), done, canceled. Below it: changes past their window and open changes without a window, then
+  **Upcoming**: open changes after today, grouped by day with their times and durations. The schedule follows the
+  priority, service, assignee and search filters but not the status tabs. List rows and board cards of a Change show
+  its planned window (◷).
+- `dt`: `new --planned-start/--planned-end` (required for `--type Change`), `update --planned-start/--planned-end/
+  --actual-start/--actual-end` (`now`, a local time like `2026-11-14 02:00`, or ISO 8601 with a zone; `none` clears an
+  actual time). `dt show` prints both windows.
 
 ### Statuses, closing and deleting
 - Statuses: **Open**, **In progress**, **Waiting**, **Resolved**, **Canceled**. Resolved and Canceled count as closed
