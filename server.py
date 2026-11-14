@@ -101,8 +101,7 @@ MIGRATIONS = (
     # (import-sqlite copies tickets in id order, and a parent can be newer than its children);
     # the API keeps it consistent and DELETE ungroups a deleted parent's children.
     ("tickets", "parent_id", "INTEGER"),
-    # Change windows (Change tickets only), UTC ISO 8601 like the other timestamps. A Change is filed with a
-    # planned window; it is resolved with the actual one. Older Change tickets keep NULLs.
+    # Change windows (Change tickets only, both optional), UTC ISO 8601 like the other timestamps.
     ("tickets", "planned_start", "TEXT"),
     ("tickets", "planned_end", "TEXT"),
     ("tickets", "actual_start", "TEXT"),
@@ -377,9 +376,9 @@ def short_moment(iso):
     return iso[:16].replace("T", " ") + "Z" if iso else "none"
 
 
-def change_window(x, kind, old, status, old_status):
+def change_window(x, kind, old):
     """Validate the window fields of a create (old None) or update. Returns {field: value} to store, only for fields
-    that were sent. Change tickets need a planned window when filed and an actual window when resolved."""
+    that were sent. Both windows are optional; null clears a field. A planned window has both ends or none."""
     sent = {f: x[f] for f in WINDOW_FIELDS if f in x}
     if kind != "Change":
         if any(v is not None for v in sent.values()):
@@ -387,13 +386,9 @@ def change_window(x, kind, old, status, old_status):
         return {}
     values = {f: (old[f] if old is not None else None) for f in WINDOW_FIELDS}
     for field, value in sent.items():
-        if value is None and field.startswith("planned"):
-            raise RequestError(400, "A Change keeps its planned window: send new times instead of null.")
         values[field] = None if value is None else parse_moment(value, field)
-    if old is None and not (values["planned_start"] and values["planned_end"]):
-        raise RequestError(400, "A Change needs a planned window: send planned_start and planned_end.")
     if bool(values["planned_start"]) != bool(values["planned_end"]):
-        raise RequestError(400, "Send both planned_start and planned_end.")
+        raise RequestError(400, "A planned window needs both planned_start and planned_end (or neither).")
     if values["planned_start"] and values["planned_end"] <= values["planned_start"]:
         raise RequestError(400, "planned_end must be after planned_start.")
     if values["actual_end"] and not values["actual_start"]:
@@ -404,9 +399,6 @@ def change_window(x, kind, old, status, old_status):
     for field in ("actual_start", "actual_end"):
         if field in sent and values[field] and values[field] > limit:
             raise RequestError(400, f"{field} is in the future; record actual times once they have happened.")
-    if status == "Resolved" and old_status != "Resolved" and not (values["actual_start"] and values["actual_end"]):
-        raise RequestError(400, "Record when the change actually ran (actual_start and actual_end) to resolve it.",
-                           code="actual_window_required")
     return {f: values[f] for f in sent}
 
 
@@ -903,7 +895,7 @@ class Handler(BaseHTTPRequestHandler):
                 fields = {"title": 160, "description": 10000, "service": 80}
                 if not all(valid(x.get(k), limit) for k, limit in fields.items()) or x.get("type") not in TYPES or x.get("priority") not in PRIORITIES:
                     raise RequestError(400, "Complete all fields with valid values.")
-                window = change_window(x, x["type"], None, "Open", None)
+                window = change_window(x, x["type"], None)
                 assignee = assignable_user(db, x.get("assignee_id"))
                 timestamp = now()
                 ticket_id = db.insert("INSERT INTO tickets(title,description,type,priority,service,requester,requester_id,assignee_id,"
@@ -932,7 +924,7 @@ class Handler(BaseHTTPRequestHandler):
             status, priority = x.get("status", row["status"]), x.get("priority", row["priority"])
             if status not in STATUSES or priority not in PRIORITIES:
                 raise RequestError(400, "Invalid status or priority")
-            window = change_window(x, row["type"], row, status, row["status"])
+            window = change_window(x, row["type"], row)
             assignee_id = row["assignee_id"]
             timestamp = now()
             requested = x.get("assignee_id")

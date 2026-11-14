@@ -182,9 +182,9 @@ API changes: the `requester` field on `POST /api/tickets` and the `author` field
 | `PATCH /api/me` `{display_name?,color?}` | signed in | Change your display name (1–80 characters, trimmed) and/or avatar color (`"#rrggbb"`, or `null` for the default). Send at least one; an invalid value gets a 400 and nothing is changed. → updated user |
 | `POST /api/me/password` `{current_password,new_password}` | signed in | Clears `must_change`, signs out other sessions |
 | `GET /api/tickets?assignee=<id>\|me\|none` | signed in | All tickets, newest activity first; `assignee` is an optional filter (400 if it's anything else) |
-| `POST /api/tickets` `{title,description,service,priority,type,assignee_id?,planned_start?,planned_end?}` | signed in | → 201 ticket. You are the requester. `assignee_id` is a user id or `null`. A `Change` needs `planned_start` and `planned_end` (see [Change windows](#change-windows)); other types refuse them |
+| `POST /api/tickets` `{title,description,service,priority,type,assignee_id?,planned_start?,planned_end?}` | signed in | → 201 ticket. You are the requester. `assignee_id` is a user id or `null`. A `Change` may send `planned_start` and `planned_end` (both or neither, see [Change windows](#change-windows)); other types refuse them |
 | `GET /api/tickets/:id` | signed in | Ticket plus `comments` (each with `kind`: `comment` or `system`) |
-| `PATCH /api/tickets/:id` `{status?,priority?,assignee_id?,parent_id?,planned_start?,planned_end?,actual_start?,actual_end?}` | signed in | Partial update; send at least one field. Moving a `Change` to Resolved needs `actual_start` and `actual_end` (sent now or already stored), else 400 with `code: actual_window_required`. → updated ticket with comments |
+| `PATCH /api/tickets/:id` `{status?,priority?,assignee_id?,parent_id?,planned_start?,planned_end?,actual_start?,actual_end?}` | signed in | Partial update; send at least one field. The window fields apply to `Change` tickets only; `null` clears one. → updated ticket with comments |
 | `POST /api/tickets/:id/comments` `{body}` | signed in | Posts an update as you |
 | `GET /api/users/assignable` | signed in | `[{id, username, display_name, color}]` of active accounts, for the assignee picker |
 | `GET/POST /api/users`, `GET/PATCH /api/users/:id` `{display_name?,role?,disabled?,color?}`, `POST /api/users/:id/password` `{password}` | admin | 403 for users, 409 for duplicate username or last-admin protection. `POST /api/users` with `{"bot": true, username, display_name}` creates a bot (no password, role `user`) |
@@ -208,12 +208,11 @@ Create a ticket with a title, details, service, and priority. You are recorded a
 
 
 ### Change windows
-- A **Change** is filed with a **planned start and end**. The new-ticket form shows the two fields when you pick
-  Change (prefilled with the next full hour, one hour long; moving the start keeps the length). Times are entered
-  and shown in the browser's timezone and stored as UTC.
-- It is **resolved** only once its **actual start and end** are recorded. In the ticket view the Change window panel
-  holds all four times. Picking Resolved marks the actual fields required.
-  Canceled needs no actual times. You can record the actual start alone while the change runs.
+- A **Change** can carry a **planned start and end** and an **actual start and end**. Both windows are optional: a
+  Change can be filed without a schedule and resolved without recording when it ran. The new-ticket form shows the
+  planned fields when you pick Change (typing a start fills the end one hour later; moving the start keeps the
+  length). The ticket view's Change window panel holds all four. Times are entered and shown in the browser's
+  timezone and stored as UTC. You can record the actual start alone while the change runs.
 - **Time fields** are one text box each, read as you type in browser local time: `11/14 2:30pm`, `11/14/2026 14:30`,
   `2026-11-14 02:00`, `tomorrow 9am`, `fri 14:00`, `14:30` (today), `now`, `in 30m`. In an end field `+2h` and a bare
   time count from the start (`01:30` after a 22:00 start is the next day). The line under the box shows how it was
@@ -221,8 +220,7 @@ Create a ticket with a title, details, service, and priority. You are recorded a
   calendar picker, **Now**, and ✕ clears. ↑/↓ step 15 minutes (Shift: 1 hour). The text is tidied to
   `mm/dd/yyyy hh:mm` when you leave the box.
 - Rules (server-side): ISO 8601 with a timezone; end after start; actual times can't be in the future (5 min of clock
-  skew allowed); the planned window can be moved but not removed. Changes filed before windows existed keep empty
-  windows and can still be edited and canceled; resolving them still needs the actual window.
+  skew allowed); a planned window has both ends or neither; an actual end needs an actual start. `null` clears a time.
 - Rescheduling and recording the actual window add activity lines ("rescheduled the planned window to …",
   "recorded the actual window: …").
 - **Change schedule** (top of the Changes view): a timeline of the day with one lane per change, the planned window
@@ -233,9 +231,8 @@ Create a ticket with a title, details, service, and priority. You are recorded a
   **Upcoming**: open changes after today, grouped by day with their times and durations. The schedule follows the
   priority, service, assignee and search filters but not the status tabs. List rows and board cards of a Change show
   its planned window (◷).
-- `dt`: `new --planned-start/--planned-end` (required for `--type Change`), `update --planned-start/--planned-end/
-  --actual-start/--actual-end` (`now`, a local time like `2026-11-14 02:00`, or ISO 8601 with a zone; `none` clears an
-  actual time). `dt show` prints both windows.
+- `dt`: `new --planned-start/--planned-end` (optional, both or neither), `update --planned-start/--planned-end/
+  --actual-start/--actual-end` (`now`, a local time like `2026-11-14 02:00`, or ISO 8601 with a zone; `none` clears a time). `dt show` prints both windows.
 
 ### Statuses, closing and deleting
 - Statuses: **Open**, **In progress**, **Waiting**, **Resolved**, **Canceled**. Resolved and Canceled count as closed

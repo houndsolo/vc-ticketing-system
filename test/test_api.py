@@ -179,7 +179,11 @@ class ApiTests(unittest.TestCase):
 
     def test_change_windows(self):
         bare = {k: v for k, v in self.ticket("Change").items() if not k.startswith("planned")}
-        self.assertEqual(self.call(method="POST", data=bare, token=self.admin)[0], 400)
+        # Both windows are optional: a Change can be filed without one and resolved without the actual one.
+        status, unplanned, _ = self.call(method="POST", data=bare, token=self.admin)
+        self.assertEqual((status, unplanned["planned_start"]), (201, None), unplanned)
+        status, d, _ = self.call(f"/api/tickets/{unplanned['id']}", "PATCH", {"status": "Resolved"}, self.admin)
+        self.assertEqual((status, d["status"], d["actual_end"]), (200, "Resolved", None), d)
         for bad in ({"planned_start": "2030-01-02T03:00:00Z"},
                     {"planned_start": "2030-01-02T03:00:00", "planned_end": "2030-01-02T04:00:00"},  # no timezone
                     {"planned_start": "tomorrow", "planned_end": "2030-01-02T04:00:00Z"},
@@ -198,9 +202,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual((t["planned_start"], t["planned_end"], t["actual_start"]),
                          ("2030-01-02T03:00:00.000Z", "2030-01-02T05:30:00.000Z", None))
         path = f"/api/tickets/{t['id']}"
-        # Resolving needs the actual window; Canceled doesn't.
-        status, data, _ = self.call(path, "PATCH", {"status": "Resolved"}, self.admin)
-        self.assertEqual((status, data.get("code")), (400, "actual_window_required"), data)
+        # Clearing one end of the planned window is refused; clearing both is fine (checked below).
         self.assertEqual(self.call(path, "PATCH", {"planned_start": None}, self.admin)[0], 400)
         self.assertEqual(self.call(path, "PATCH", {"actual_end": "2026-01-01T01:00:00Z"}, self.admin)[0], 400)
         self.assertEqual(self.call(path, "PATCH", {"actual_start": "2999-01-01T01:00:00Z"}, self.admin)[0], 400)
@@ -215,11 +217,11 @@ class ApiTests(unittest.TestCase):
         self.assertEqual((status, d["status"], d["actual_start"], d["actual_end"]),
                          (200, "Resolved", "2026-01-01T01:00:00.000Z", "2026-01-01T02:15:00.000Z"), d)
         self.assertIn("recorded the actual window: 2026-01-01 01:00Z → 2026-01-01 02:15Z", d["comments"][-1]["body"])
-        # A Change filed before windows existed can still be edited and canceled without one.
-        legacy = self.call(method="POST", data=self.ticket("Change"), token=self.admin)[1]
-        self.sql(f"UPDATE tickets SET planned_start=NULL, planned_end=NULL WHERE id={legacy['id']}")
-        self.assertEqual(self.call(f"/api/tickets/{legacy['id']}", "PATCH", {"priority": "Low"}, self.admin)[0], 200)
-        self.assertEqual(self.call(f"/api/tickets/{legacy['id']}", "PATCH", {"status": "Canceled"}, self.admin)[0], 200)
+        # Both windows can be cleared again.
+        status, d, _ = self.call(path, "PATCH", {"planned_start": None, "planned_end": None, "actual_start": None,
+                                                "actual_end": None}, self.admin)
+        self.assertEqual((status, d["planned_start"], d["actual_start"]), (200, None, None), d)
+        self.assertIn("cleared the planned window", [c["body"] for c in d["comments"]])
 
     # --- canceled status and deleting tickets -------------------------------
 
@@ -929,17 +931,16 @@ class ApiTests(unittest.TestCase):
         self.assertIn("UPDATED", table)
         self.assertRegex(table, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
         self.assertEqual(self.dt("update", str(second), "--status", "Canceled", token=token).returncode, 0)
-        # Change windows: planned on create (local time or ISO), actual to resolve.
+        # Change windows (optional): planned on create (local time or ISO), actual when it ran.
         no_window = self.dt("new", "--type", "change", "--title", "Swap", "--service", "Network", "--description", "x", token=token)
-        self.assertEqual(no_window.returncode, 2)
-        self.assertIn("--planned-start", no_window.stderr)
+        self.assertEqual(no_window.returncode, 0, no_window.stderr)
+        half = self.dt("new", "--type", "change", "--title", "Swap", "--service", "Network", "--description", "x",
+                       "--planned-start", "now", token=token)
+        self.assertEqual(half.returncode, 2)
         change = self.dt("new", "--type", "change", "--title", "Swap", "--service", "Network", "--description", "x",
                          "--planned-start", "2030-01-02T03:00Z", "--planned-end", "2030-01-02 05:00", token=token, TZ="UTC")
         self.assertEqual(change.returncode, 0, change.stderr)
         change_label = change.stdout.split()[0]
-        refused = self.dt("update", change_label, "--status", "resolved", token=token)
-        self.assertEqual(refused.returncode, 1)
-        self.assertIn("actual_start", refused.stderr)
         done = self.dt("update", change_label, "--status", "resolved", "--actual-start", "2026-01-01T01:00Z",
                        "--actual-end", "now", token=token, TZ="UTC")
         self.assertEqual(done.returncode, 0, done.stderr)

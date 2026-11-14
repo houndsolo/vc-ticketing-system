@@ -255,8 +255,8 @@ def cmd_new(client, args):
     if args.assignee is not None:
         data["assignee_id"] = client.resolve_user(args.assignee)
     window = {field: getattr(args, field) for field, _ in WINDOW_ARGS[:2] if getattr(args, field) is not None}
-    if args.type == "Change" and len(window) < 2:
-        raise DtError("a Change needs its planned window: --planned-start and --planned-end "
+    if len(window) == 1:
+        raise DtError("a planned window needs both --planned-start and --planned-end "
                       "(e.g. --planned-start '2026-11-14 02:00' --planned-end '2026-11-14 03:00', local time)", 2)
     if window and args.type != "Change":
         raise DtError("only Change tickets have a planned window", 2)
@@ -378,8 +378,8 @@ values:
   --service   free text, 1-80 characters; the web form suggests {', '.join(SERVICES)}
   times       now, ISO 8601 with a timezone (2026-11-14T07:00Z), or local time ('2026-11-14 02:00')
 
-change windows: a Change is filed with --planned-start/--planned-end and resolved only once
-  --actual-start/--actual-end are recorded (e.g. update DT-9 --status resolved --actual-start '...' --actual-end now)
+change windows (optional, Change tickets only): --planned-start/--planned-end when it's scheduled,
+  --actual-start/--actual-end when it ran (e.g. update DT-9 --status resolved --actual-start '...' --actual-end now)
 
 exit codes: 0 ok, 1 request refused by the server, 2 usage/config error, 3 server unreachable""")
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -401,8 +401,8 @@ exit codes: 0 ok, 1 request refused by the server, 2 usage/config error, 3 serve
     p.add_argument("--type", type=choice(TYPES, "type"), default="Issue", help=" | ".join(TYPES) + " (default Issue)")
     p.add_argument("--priority", type=priority, default="Medium", help=" | ".join(PRIORITIES) + " (default Medium)")
     p.add_argument("--assignee", metavar="USERNAME|me", help="assign on creation")
-    p.add_argument("--planned-start", type=when_arg, metavar="TIME", help="Change: when it is planned to start (required)")
-    p.add_argument("--planned-end", type=when_arg, metavar="TIME", help="Change: when it is planned to end (required)")
+    p.add_argument("--planned-start", type=when_arg, metavar="TIME", help="Change: when it is planned to start (optional, with --planned-end)")
+    p.add_argument("--planned-end", type=when_arg, metavar="TIME", help="Change: when it is planned to end")
     p.add_argument("--json", action="store_true", help="print the created ticket as JSON")
     p.set_defaults(func=cmd_new)
 
@@ -441,8 +441,8 @@ exit codes: 0 ok, 1 request refused by the server, 2 usage/config error, 3 serve
     p.add_argument("--assignee", metavar="USERNAME|me|none", help="none unassigns")
     p.add_argument("--parent", metavar="DT-###|none", help="put the ticket in that ticket's group; none ungroups it")
     for field, flag in WINDOW_ARGS:
-        p.add_argument(flag, dest=field, type=when_arg, default=False, metavar="TIME" + ("|none" if "actual" in field else ""),
-                       help=f"Change: {field.replace('_', ' ')}" + (" (needed to resolve)" if "actual" in field else " (reschedule)"))
+        p.add_argument(flag, dest=field, type=when_arg, default=False, metavar="TIME|none",
+                       help=f"Change: {field.replace('_', ' ')} (none clears it)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_update)
 
